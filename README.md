@@ -13,7 +13,7 @@ CLI tool that scans ZIP files under a directory and deletes image and JSON entri
 ## Requirements
 - Rust stable
 
-## Install
+## Build
 ```bash
 cargo build --release
 ```
