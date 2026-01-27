@@ -446,8 +446,8 @@ fn decide_deletions(
     }
 
     if let Some(b) = bar {
-        // WHY: 解析完了をユーザに即時示すため
-        b.finish_and_clear();
+        // WHY: 後続の書き込みフェーズでも同じバーを使うため消さない
+        b.tick();
     }
 
     for (stem, prompt_opt) in json_prompts.iter() {
@@ -841,10 +841,17 @@ fn warn_if_path_long(path: &Path) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use zip::CompressionMethod;
     use zip::write::FileOptions;
     use zip::ZipWriter;
+
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn deletes_group_when_json_prompt_matches_keyword() {
@@ -1186,6 +1193,7 @@ mod tests {
 
     #[test]
     fn clear_cache_file_removes_existing() {
+        let _guard = env_guard();
         let dir = tempdir().unwrap();
         let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
         unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
@@ -1207,6 +1215,7 @@ mod tests {
 
     #[test]
     fn clear_cache_file_ok_when_missing() {
+        let _guard = env_guard();
         let dir = tempdir().unwrap();
         let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
         unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
