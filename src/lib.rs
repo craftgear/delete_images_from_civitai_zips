@@ -69,6 +69,7 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
     signal_flag::register(SIGINT, cancel.clone()).map_err(|e| AppError::Invalid(e.to_string()))?;
     let cache_path = cache_file_path();
     let mut cache = load_cache(&cache_path);
+    let mut errors: Vec<(std::path::PathBuf, AppError)> = Vec::new();
     let zip_paths: Vec<_> = WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
@@ -92,7 +93,13 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
             return Err(AppError::Interrupted);
         }
         warn_if_path_long(path);
-        let meta = io_ctx(path, fs::metadata(path))?;
+        let meta = match io_ctx(path, fs::metadata(path)) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push((path.clone(), e));
+                continue;
+            }
+        };
         let zip_hash = zip_hash(path, &meta);
         if cache_hit(&cache, &keyword_key, path, &zip_hash) {
             if progress {
@@ -111,7 +118,13 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         if progress {
             eprintln!();
         }
-        let changed = process_zip(path, &keywords, progress, &cancel)?;
+        let changed = match process_zip(path, &keywords, progress, &cancel) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push((path.clone(), e));
+                continue;
+            }
+        };
         let final_hash = if changed {
             file_sha256(path)?
         } else {
@@ -119,6 +132,16 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         };
         cache_insert(&mut cache, &keyword_key, path, final_hash);
         save_cache(&cache_path, &cache)?;
+    }
+    if !errors.is_empty() {
+        eprintln!("{} {}", color_msg("Errors", "31"), errors.len());
+        for (p, e) in errors.iter() {
+            eprintln!("- {}: {}", p.display(), e);
+        }
+        return Err(AppError::Invalid(format!(
+            "{} file(s) failed; see log",
+            errors.len()
+        )));
     }
     Ok(())
 }
@@ -1249,6 +1272,44 @@ mod tests {
         unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
 
         clear_cache_file().unwrap();
+
+        match prev {
+            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
+            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
+        }
+    }
+
+    #[test]
+    fn run_skips_errors_and_reports() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
+        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
+
+        let good = dir.path().join("good.zip");
+        let mut zip_file = File::create(&good).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("a.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let bad = dir.path().join("bad.zip");
+        fs::write(&bad, b"not a zip").unwrap();
+
+        let result = run(dir.path(), "cat", false);
+        assert!(result.is_err());
+
+        let cache = load_cache(&cache_file_path());
+        let keyword_key = keyword_key(&vec!["cat".into()]);
+        assert!(cache_hit(
+            &cache,
+            &keyword_key,
+            &good,
+            &file_sha256(&good).unwrap()
+        ));
 
         match prev {
             Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
