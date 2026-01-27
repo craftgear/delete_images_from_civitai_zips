@@ -51,6 +51,7 @@ jobs:
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ env.SHORT_SHA }}
-          name: Auto release ${{ env.SHORT_SHA }}
+          tag_name: v0.1.0-build.${{ env.SHORT_SHA }}
+          name: Auto release v0.1.0-build.${{ env.SHORT_SHA }}
+          make_latest: true
           files: target/release/delete_images_from_zips.exe
