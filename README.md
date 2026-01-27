@@ -59,6 +59,9 @@ delete_images_from_zips ./data --keywords cat,dog
 
 # disable progress output
 delete_images_from_zips ./data --keywords cat --progress false
+
+# clear cache only
+delete_images_from_zips --clear-cache
 ```
 
 ## Development
