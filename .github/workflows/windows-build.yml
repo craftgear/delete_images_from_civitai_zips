@@ -45,13 +45,48 @@ jobs:
 
       - name: Set release tag
         if: github.event_name == 'push'
-        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $env:GITHUB_ENV
+        run: |
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $env:GITHUB_ENV
+          echo "RELEASE_TAG=v0.1.0-build.$(git rev-parse --short HEAD)" >> $env:GITHUB_ENV
 
       - name: Create GitHub release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0-build.${{ env.SHORT_SHA }}
-          name: Auto release v0.1.0-build.${{ env.SHORT_SHA }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Auto release ${{ env.RELEASE_TAG }}
           make_latest: true
           files: target/release/delete_images_from_zips.exe
+
+      - name: Delete old releases and tags
+        if: github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const keepTag = process.env.RELEASE_TAG;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            for (const r of releases) {
+              if (r.tag_name === keepTag) continue;
+              core.info(`Deleting release ${r.tag_name}`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: r.id,
+              });
+              // delete tag ref if exists
+              const ref = `tags/${r.tag_name}`;
+              try {
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref,
+                });
+                core.info(`Deleted ref ${ref}`);
+              } catch (err) {
+                core.info(`Ref ${ref} delete skipped: ${err.message}`);
+              }
+            }
