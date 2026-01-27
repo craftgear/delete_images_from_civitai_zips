@@ -27,10 +27,14 @@ cargo build --release
 delete_images_from_zips /path/to/zips --keywords "cat,dog"
 ```
 
+### Maintenance
+- Clear cache: `delete_images_from_zips --clear-cache`
+
 ### Options
 - `DIR` Path to scan for ZIP files
 - `--keywords` Comma separated keywords used for matching
 - `--progress` Show progress to stderr, default is true
+- `--clear-cache` Delete cache file and exit
 
 ## Behavior
 - For each ZIP file, prompts are read from JSON first. If a JSON entry has no prompt, the tool checks the corresponding image metadata.

@@ -118,6 +118,15 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
     Ok(())
 }
 
+pub fn clear_cache_file() -> Result<(), AppError> {
+    let path = cache_file_path();
+    if path.exists() {
+        // WHY: 利用者が即座に再試行できるようにキャッシュ削除を提供
+        io_ctx(&path, fs::remove_file(&path))?;
+    }
+    Ok(())
+}
+
 fn process_zip(
     path: &Path,
     keywords: &[String],
@@ -703,8 +712,10 @@ fn keyword_key(keywords: &[String]) -> String {
 }
 
 fn cache_file_path() -> std::path::PathBuf {
-    let home = env::var_os("HOME").map(std::path::PathBuf::from);
-    let base = home.unwrap_or_else(|| std::path::PathBuf::from("."));
+    let base = env::var_os("DELETE_IMAGES_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     base.join(".cache").join("delete_images_from_zips").join("processed.json")
 }
 
@@ -1171,6 +1182,41 @@ mod tests {
         finalize_no_deletions(&bar, 5);
         assert_eq!(bar.length(), Some(5));
         assert_eq!(bar.position(), 5);
+    }
+
+    #[test]
+    fn clear_cache_file_removes_existing() {
+        let dir = tempdir().unwrap();
+        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
+        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
+
+        let cache = dir
+            .path()
+            .join(".cache/delete_images_from_zips/processed.json");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, "{}").unwrap();
+
+        clear_cache_file().unwrap();
+        assert!(!cache.exists());
+
+        match prev {
+            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
+            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
+        }
+    }
+
+    #[test]
+    fn clear_cache_file_ok_when_missing() {
+        let dir = tempdir().unwrap();
+        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
+        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
+
+        clear_cache_file().unwrap();
+
+        match prev {
+            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
+            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
+        }
     }
 
     #[test]
