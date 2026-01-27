@@ -1,17 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufWriter, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use filetime::{set_file_times, FileTime};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
 use regex::Regex;
+use sha2::{Digest, Sha256};
+use signal_hook::consts::SIGINT;
+use signal_hook::flag as signal_flag;
 use thiserror::Error;
 use walkdir::WalkDir;
 use zip::read::ZipFile;
-use zip::write::FileOptions;
 use zip::ZipArchive;
+use tempfile::Builder;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -19,19 +24,28 @@ pub enum AppError {
     Io(#[from] std::io::Error),
     #[error("Zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
+    #[error("Zip error at \u{1b}[91m{path}\u{1b}[0m: {source}")]
+    ZipWithPath {
+        path: String,
+        source: zip::result::ZipError,
+    },
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("EXIF parse error: {0}")]
     Exif(#[from] exif::Error),
     #[error("Invalid data: {0}")]
     Invalid(String),
+    #[error("Interrupted")]
+    Interrupted,
 }
 
+type CacheMap = HashMap<String, HashMap<String, String>>;
+
 #[derive(Clone)]
-struct EntryData {
+struct EntryMeta {
     name: String,
-    data: Vec<u8>,
-    options: FileOptions,
+    stem: String,
+    kind: EntryKind,
 }
 
 #[derive(Clone, Copy)]
@@ -42,16 +56,14 @@ enum EntryKind {
     Other,
 }
 
-#[derive(Clone)]
-struct EntryAnalysis {
-    name: String,
-    stem: String,
-    kind: EntryKind,
-    prompt_tags: Option<Vec<String>>, // None means no prompt, Some(vec) means prompt found
-}
 
 pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppError> {
     let keywords = parse_keywords(keywords_csv);
+    let keyword_key = keyword_key(&keywords);
+    let cancel = Arc::new(AtomicBool::new(false));
+    signal_flag::register(SIGINT, cancel.clone()).map_err(|e| AppError::Invalid(e.to_string()))?;
+    let cache_path = cache_file_path();
+    let mut cache = load_cache(&cache_path);
     let zip_paths: Vec<_> = WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
@@ -71,27 +83,58 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
     }
 
     for path in zip_paths.iter() {
-        process_zip(path, &keywords, progress)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AppError::Interrupted);
+        }
+        let meta = fs::metadata(path)?;
+        let zip_hash = zip_hash(path, &meta);
+        if cache_hit(&cache, &keyword_key, path, &zip_hash) {
+            if progress {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                eprintln!(
+                    "{} {}",
+                    color_msg(&name, "1;37"),
+                    color_msg("skipped (cached)", "90")
+                );
+            }
+            continue;
+        }
+        if progress {
+            eprintln!();
+        }
+        process_zip(path, &keywords, progress, &cancel)?;
+        cache_insert(&mut cache, &keyword_key, path, zip_hash);
+        save_cache(&cache_path, &cache)?;
     }
     Ok(())
 }
 
-fn process_zip(path: &Path, keywords: &[String], progress: bool) -> Result<(), AppError> {
+fn process_zip(
+    path: &Path,
+    keywords: &[String],
+    progress: bool,
+    cancel: &AtomicBool,
+) -> Result<(), AppError> {
     let meta = fs::metadata(path)?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
+    let dir_times = dir_times(path);
 
     // 読み取りフェーズ
-    let (entries, bar) = {
+    let (entries, read_bar) = {
         let file = File::open(path)?;
-        let mut archive = ZipArchive::new(file)?;
-        let total = archive.len() as u64;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        let _total = archive.len() as u64;
 
-        let bar = if progress {
-            let b = ProgressBar::new(total.saturating_mul(2));
+        let read_bar = if progress {
+            let b = ProgressBar::new(_total.max(1));
             // WHY: 進捗の視認性を優先
             b.set_style(
-                ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} ({percent}%) {msg}")
+                ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
                     .unwrap()
                     .progress_chars("=>-"),
             );
@@ -99,8 +142,8 @@ fn process_zip(path: &Path, keywords: &[String], progress: bool) -> Result<(), A
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.display().to_string());
-            b.set_prefix(name);
-            b.set_message("reading");
+            b.set_prefix(color_msg(&name, "1;37"));
+            b.set_message(color_msg("scanning", "36"));
             Some(b)
         } else {
             None
@@ -108,58 +151,127 @@ fn process_zip(path: &Path, keywords: &[String], progress: bool) -> Result<(), A
 
         let mut list = Vec::new();
         for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
+            let file = archive
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
             if file.name().ends_with('/') {
                 continue;
             }
-            list.push(read_entry(&mut file)?);
-            if let Some(ref b) = bar {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            list.push(entry_meta_from_name(file.name())?);
+            if let Some(ref b) = read_bar {
                 b.inc(1);
             }
         }
-        if let Some(ref b) = bar {
-            b.set_message("writing");
-        }
-        (list, bar)
+        (list, read_bar)
     };
 
-    let deletions = decide_deletions(&entries, keywords)?;
-    write_filtered_zip(path, &entries, &deletions, bar.as_ref())?;
-    set_file_times(path, atime, mtime)?;
-    Ok(())
-}
+    let deletions = decide_deletions(
+        path,
+        &entries,
+        entries.len() as u64,
+        keywords,
+        read_bar.as_ref(),
+        cancel,
+    )?;
+    if deletions.is_empty() {
+        if let Some(ref b) = read_bar {
+            // WHY: 1本のバーを使い回すため
+            b.set_length(1);
+            b.set_position(1);
+            b.set_message(color_msg("writing (skipped)", "90"));
+            b.finish_with_message(color_msg("done", "32"));
+        }
+        set_file_times(path, atime, mtime)?;
+        return Ok(());
+    }
+    if let Some(ref b) = read_bar {
+        let kept_len = entries.len() as u64 - deletions.len() as u64;
+        b.set_length(kept_len.max(1));
+        b.set_position(0);
+        b.set_message(color_msg("writing", "32"));
+    }
 
-fn read_entry(file: &mut ZipFile) -> Result<EntryData, AppError> {
-    let mut data = Vec::with_capacity(file.size() as usize);
-    file.read_to_end(&mut data)?;
-    let options = FileOptions::default()
-        .compression_method(file.compression())
-        .last_modified_time(file.last_modified())
-        .unix_permissions(file.unix_mode().unwrap_or(0o644));
-    Ok(EntryData {
-        name: file.name().to_string(),
-        data,
-        options,
-    })
+    write_filtered_zip(
+        path,
+        &entries,
+        &deletions,
+        read_bar.as_ref(),
+        cancel,
+        atime,
+        mtime,
+    )?;
+
+    if !deletions.is_empty() {
+        // WHY: 書き換えが発生したときだけ元の時刻を復元して変更検知を抑制
+        set_file_times(path, atime, mtime)?;
+    }
+    if let Some((dir_path, dir_atime, dir_mtime)) = dir_times {
+        // WHY: tmp作成やrenameで更新されたディレクトリ日時を元に戻す
+        let _ = set_file_times(&dir_path, dir_atime, dir_mtime);
+    }
+    Ok(())
 }
 
 fn write_filtered_zip(
     path: &Path,
-    entries: &[EntryData],
+    entries: &[EntryMeta],
     deletions: &HashSet<String>,
     bar: Option<&ProgressBar>,
+    cancel: &AtomicBool,
+    atime: FileTime,
+    mtime: FileTime,
 ) -> Result<(), AppError> {
-    let kept: Vec<&EntryData> = entries
-        .iter()
-        .filter(|e| !deletions.contains(&e.name))
-        .collect();
+    let kept_len = entries.len().saturating_sub(deletions.len());
 
-    let mut buffer: Vec<u8> = Vec::new();
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+
+    let orig_permissions = fs::metadata(path)?.permissions();
+
+    let mut tmp = Builder::new()
+        .prefix("civitai_tmp")
+        .suffix(".zip")
+        .tempfile_in(dir)?;
+
+    // WHY: 一時ファイルの作成日時を元ZIPに合わせ、後工程でのタイムスタンプ差異を減らす
+    set_file_times(tmp.path(), atime, mtime)?;
+
     {
-        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
-        for entry in kept {
-            writer.start_file(&entry.name, entry.options)?;
-            writer.write_all(&entry.data)?;
+        let buf_size = env::var("BUF_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|mb| mb * (1 << 20))
+            .unwrap_or(16 * (1 << 20));
+
+        // WHY: HDD/遅いストレージ向けに書き込み呼び出し回数をさらに減らす
+        // WHY: BUF_MBで可変にしベンチしやすくする
+        let buf = BufWriter::with_capacity(buf_size, tmp.as_file_mut());
+        let mut writer = zip::ZipWriter::new(buf);
+        if let Some(b) = bar {
+            b.tick(); // WHY: 0件書き込みでもバーを一度描画するため
+        }
+        // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
+        let mut src = ZipArchive::new(File::open(path)?)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        for i in 0..src.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let file = src
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            if file.name().ends_with('/') {
+                continue;
+            }
+            if deletions.contains(file.name()) {
+                continue;
+            }
+            writer.raw_copy_file(file)?;
             if let Some(b) = bar {
                 b.inc(1);
             }
@@ -167,54 +279,161 @@ fn write_filtered_zip(
         writer.finish()?;
     }
 
-    let orig_permissions = fs::metadata(path)?.permissions();
-    {
-        let mut dst = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        dst.write_all(&buffer)?;
-        dst.sync_all()?;
+    if let Some(b) = bar {
+        // WHY: syncやタイムスタンプ復元など後処理中であることを示すため
+        b.set_message(color_msg("finalizing", "90"));
+        b.tick();
     }
-    fs::set_permissions(path, orig_permissions)?;
+
+    // WHY: 書き込み後のfsyncコストを避けるため、renameベースで差し替える
+    fs::set_permissions(tmp.path(), orig_permissions.clone())?;
+
+    if path.exists() {
+        // WHY: Windows上書き問題回避
+        fs::remove_file(path)?;
+    }
+    let persist_result = tmp.persist(path);
+    if let Err(err) = persist_result {
+        return Err(AppError::Io(err.error));
+    }
 
     if let Some(b) = bar {
-        b.set_message("done");
-        b.finish_and_clear();
+        if kept_len == 0 {
+            // WHY: 全削除時も書き込みフェーズを完了表示にするため
+            if let Some(len) = b.length() {
+                b.set_position(len);
+            }
+        }
+        b.set_message(color_msg("done", "32"));
+        b.finish_with_message(color_msg("done", "32"));
     }
     Ok(())
 }
 
 fn decide_deletions(
-    entries: &[EntryData],
+    path: &Path,
+    entries: &[EntryMeta],
+    base_len: u64,
     keywords: &[String],
+    bar: Option<&ProgressBar>,
+    cancel: &AtomicBool,
 ) -> Result<HashSet<String>, AppError> {
     let mut deletions = HashSet::new();
-
-    // 解析を並列化
-    let analyses: Vec<EntryAnalysis> = entries
-        .par_iter()
-        .map(analyze_entry)
-        .collect::<Result<_, _>>()?;
-
-    let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
-    let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut stem_to_entries: HashMap<String, Vec<String>> = HashMap::new();
+    let mut json_name_to_stem: HashMap<String, String> = HashMap::new();
+    let mut image_name_to_meta: HashMap<String, (String, EntryKind)> = HashMap::new();
 
-    for a in &analyses {
+    for e in entries {
         stem_to_entries
-            .entry(a.stem.clone())
+            .entry(e.stem.clone())
             .or_default()
-            .push(a.name.clone());
-        match a.kind {
+            .push(e.name.clone());
+        match e.kind {
             EntryKind::Json => {
-                json_prompts.insert(a.stem.clone(), a.prompt_tags.clone());
+                json_name_to_stem.insert(e.name.clone(), e.stem.clone());
             }
             EntryKind::Png | EntryKind::Webp => {
-                image_prompts.insert(a.stem.clone(), a.prompt_tags.clone());
+                image_name_to_meta.insert(e.name.clone(), (e.stem.clone(), e.kind));
             }
             EntryKind::Other => {}
         }
+    }
+
+    let json_count = json_name_to_stem.len() as u64;
+
+    let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    if json_count > 0 {
+        let mut src = ZipArchive::new(File::open(path)?)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        for i in 0..src.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let mut file = src
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            if file.name().ends_with('/') {
+                continue;
+            }
+            let stem = match json_name_to_stem.get(file.name()) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let prompt = json_prompt_tags_from_reader(&mut file)?;
+            json_prompts.insert(stem, prompt);
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        }
+    }
+
+    let mut needs_image_check: HashSet<String> = HashSet::new();
+    for (stem, prompt_opt) in json_prompts.iter() {
+        if prompt_opt.is_none() {
+            needs_image_check.insert(stem.clone());
+        }
+    }
+
+    let mut image_names: Vec<String> = Vec::new();
+    if !needs_image_check.is_empty() {
+        for (name, (stem, _kind)) in image_name_to_meta.iter() {
+            if needs_image_check.contains(stem) {
+                image_names.push(name.clone());
+            }
+        }
+    }
+
+    if let Some(b) = bar {
+        let new_len = base_len + json_count + image_names.len() as u64;
+        b.set_length(new_len.max(1));
+        b.set_style(
+            ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        if b.position() < base_len {
+            // WHY: 既存の読み取り進捗を維持するため
+            b.set_position(base_len);
+        }
+    }
+
+    let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    if !image_names.is_empty() {
+        let image_name_set: HashSet<String> = image_names.into_iter().collect();
+        let mut src = ZipArchive::new(File::open(path)?)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        for i in 0..src.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let mut file = src
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            if file.name().ends_with('/') {
+                continue;
+            }
+            if !image_name_set.contains(file.name()) {
+                continue;
+            }
+            let (stem, kind) = match image_name_to_meta.get(file.name()) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let prompt = match kind {
+                EntryKind::Png => png_prompt_tags(&read_zipfile_bytes(&mut file)?),
+                EntryKind::Webp => webp_prompt_tags(&read_zipfile_bytes(&mut file)?),
+                _ => None,
+            };
+            image_prompts.insert(stem, prompt);
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        }
+    }
+
+    if let Some(b) = bar {
+        // WHY: 解析完了をユーザに即時示すため
+        b.finish_and_clear();
     }
 
     for (stem, prompt_opt) in json_prompts.iter() {
@@ -223,7 +442,7 @@ fn decide_deletions(
                 if tags_match(tags, keywords) {
                     if let Some(names) = stem_to_entries.get(stem) {
                         for name in names {
-                            deletions.insert(name.clone());
+                            maybe_insert_model_safe(&mut deletions, name);
                         }
                     }
                 }
@@ -232,7 +451,7 @@ fn decide_deletions(
                 Some(None) => {
                     if let Some(names) = stem_to_entries.get(stem) {
                         for name in names {
-                            deletions.insert(name.clone());
+                            maybe_insert_model_safe(&mut deletions, name);
                         }
                     }
                 }
@@ -241,7 +460,7 @@ fn decide_deletions(
                     if let Some(names) = stem_to_entries.get(stem) {
                         for name in names {
                             if Path::new(name).extension().map(|e| e == "json") == Some(true) {
-                                deletions.insert(name.clone());
+                                maybe_insert_model_safe(&mut deletions, name);
                             }
                         }
                     }
@@ -266,40 +485,44 @@ fn parse_keywords(csv: &str) -> Vec<String> {
         .collect()
 }
 
-fn analyze_entry(entry: &EntryData) -> Result<EntryAnalysis, AppError> {
-    let file_name = Path::new(&entry.name)
+fn entry_meta_from_name(name: &str) -> Result<EntryMeta, AppError> {
+    let file_name = Path::new(name)
         .file_name()
-        .ok_or_else(|| AppError::Invalid(format!("Invalid file name: {}", entry.name)))?
+        .ok_or_else(|| AppError::Invalid(format!("Invalid file name: {}", name)))?
         .to_string_lossy()
         .to_string();
     let stem = Path::new(&file_name)
         .file_stem()
-        .ok_or_else(|| AppError::Invalid(format!("Invalid stem: {}", entry.name)))?
+        .ok_or_else(|| AppError::Invalid(format!("Invalid stem: {}", name)))?
         .to_string_lossy()
         .to_string();
     let ext = Path::new(&file_name)
         .extension()
         .map(|s| s.to_string_lossy().to_ascii_lowercase());
-
-    let (kind, prompt_tags) = match ext.as_deref() {
-        Some("json") => (EntryKind::Json, json_prompt_tags(&entry.data)?),
-        Some("png") => (EntryKind::Png, png_prompt_tags(&entry.data)),
-        Some("webp") => (EntryKind::Webp, webp_prompt_tags(&entry.data)),
-        _ => (EntryKind::Other, None),
+    let kind = match ext.as_deref() {
+        Some("json") => EntryKind::Json,
+        Some("png") => EntryKind::Png,
+        Some("webp") => EntryKind::Webp,
+        _ => EntryKind::Other,
     };
 
-    Ok(EntryAnalysis {
-        name: entry.name.clone(),
+    Ok(EntryMeta {
+        name: name.to_string(),
         stem,
         kind,
-        prompt_tags,
     })
 }
 
-fn json_prompt_tags(data: &[u8]) -> Result<Option<Vec<String>>, AppError> {
-    let v: serde_json::Value = serde_json::from_slice(data)?;
+fn json_prompt_tags_from_reader<R: Read>(reader: R) -> Result<Option<Vec<String>>, AppError> {
+    let v: serde_json::Value = serde_json::from_reader(reader)?;
     let prompt = find_prompt(&v);
     Ok(prompt.map(|s| normalize_prompt(&s)))
+}
+
+fn read_zipfile_bytes(file: &mut ZipFile) -> Result<Vec<u8>, AppError> {
+    let mut data = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut data)?;
+    Ok(data)
 }
 
 fn normalize_prompt(s: &str) -> Vec<String> {
@@ -464,12 +687,101 @@ fn extract_webp_chunk(data: &[u8], chunk: &[u8; 4]) -> Option<Vec<u8>> {
     None
 }
 
+fn color_msg(msg: &str, code: &str) -> String {
+    format!("\x1b[{}m{}\x1b[0m", code, msg)
+}
+
+fn keyword_key(keywords: &[String]) -> String {
+    let mut list = keywords.to_vec();
+    list.sort();
+    list.join(",")
+}
+
+fn cache_file_path() -> std::path::PathBuf {
+    let home = env::var_os("HOME").map(std::path::PathBuf::from);
+    let base = home.unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join(".cache").join("delete_images_from_zips").join("processed.json")
+}
+
+fn load_cache(path: &std::path::Path) -> CacheMap {
+    let data = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
+}
+
+fn save_cache(path: &std::path::Path, cache: &CacheMap) -> Result<(), AppError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let data = serde_json::to_string(cache)?;
+    fs::write(path, data)?;
+    Ok(())
+}
+
+fn cache_hit(cache: &CacheMap, keyword: &str, path: &Path, hash: &str) -> bool {
+    cache
+        .get(keyword)
+        .and_then(|m| m.get(&path.display().to_string()))
+        .map(|v| v == hash)
+        .unwrap_or(false)
+}
+
+fn cache_insert(cache: &mut CacheMap, keyword: &str, path: &Path, hash: String) {
+    cache
+        .entry(keyword.to_string())
+        .or_default()
+        .insert(path.display().to_string(), hash);
+}
+
+fn zip_hash(path: &Path, meta: &fs::Metadata) -> String {
+    let mtime = FileTime::from_last_modification_time(meta);
+    let mut hasher = Sha256::new();
+    hasher.update(path.display().to_string().as_bytes());
+    hasher.update(mtime.unix_seconds().to_le_bytes());
+    hasher.update(mtime.nanoseconds().to_le_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    let out = hasher.finalize();
+    to_hex(&out)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+fn dir_times(path: &Path) -> Option<(std::path::PathBuf, FileTime, FileTime)> {
+    let dir = path.parent()?;
+    let meta = fs::metadata(dir).ok()?;
+    let atime = FileTime::from_last_access_time(&meta);
+    let mtime = FileTime::from_last_modification_time(&meta);
+    Some((dir.to_path_buf(), atime, mtime))
+}
+
+fn is_model_info(name: &str) -> bool {
+    Path::new(name)
+        .file_name()
+        .map(|n| n == "model_info.json")
+        == Some(true)
+}
+
+fn maybe_insert_model_safe(target: &mut HashSet<String>, name: &str) {
+    if !is_model_info(name) {
+        target.insert(name.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
     use zip::CompressionMethod;
+    use zip::write::FileOptions;
     use zip::ZipWriter;
 
     #[test]
@@ -491,7 +803,8 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
 
-        process_zip(&zip_path, &vec!["dog".into()], false).unwrap();
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -515,7 +828,8 @@ mod tests {
         writer.write_all(&make_png_without_prompt()).unwrap();
         writer.finish().unwrap();
 
-        process_zip(&zip_path, &vec!["dog".into()], false).unwrap();
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -541,11 +855,76 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
 
-        process_zip(&zip_path, &vec!["dog".into()], false).unwrap();
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
         assert_eq!(archive.len(), 2);
+    }
+
+    #[test]
+    fn keeps_files_when_json_prompt_non_matching_even_if_image_matches() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("z.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.start_file("z.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_prompt("dog"))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+
+        let file = File::open(&zip_path).unwrap();
+        let archive = ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 2);
+    }
+
+    #[test]
+    fn deletes_when_json_prompt_matches_even_if_image_first() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("q.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_prompt("cat"))
+            .unwrap();
+        writer.start_file("q.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"dog"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+
+        let file = File::open(&zip_path).unwrap();
+        let archive = ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 0);
+    }
+
+    #[test]
+    fn zip_error_shows_red_path() {
+        let err = AppError::ZipWithPath {
+            path: "bad.zip".into(),
+            source: zip::result::ZipError::FileNotFound,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("\u{1b}[91mbad.zip\u{1b}[0m"));
     }
 
     #[test]
@@ -565,7 +944,8 @@ mod tests {
         writer.write_all(&[0u8; 4]).unwrap();
         writer.finish().unwrap();
 
-        process_zip(&zip_path, &vec!["anthro".into()], false).unwrap();
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["anthro".into()], false, &cancel).unwrap();
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -591,7 +971,8 @@ mod tests {
         let ctime_before = FileTime::from_creation_time(&meta).unwrap_or(mtime_before);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
-        process_zip(&zip_path, &vec!["cat".into()], false).unwrap();
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
 
         let meta_after = fs::metadata(&zip_path).unwrap();
         let mtime_after = FileTime::from_last_modification_time(&meta_after);
@@ -622,6 +1003,114 @@ mod tests {
     fn normalize_removes_emphasis_and_weights() {
         let tags = normalize_prompt("((Hoge)), (foo:1.5), [bar:2], {baz}, ( red fox :2.0)");
         assert_eq!(tags, vec!["hoge", "foo", "bar", "baz", "red fox"]);
+    }
+
+    #[test]
+    fn color_msg_wraps_with_ansi_code() {
+        assert_eq!(
+            color_msg("reading", "36"),
+            "\u{1b}[36mreading\u{1b}[0m".to_string()
+        );
+    }
+
+    #[test]
+    fn keeps_model_info_even_when_prompt_matches() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("model.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("a.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.start_file("model_info.json", opts).unwrap();
+        writer
+            .write_all(r#"{"meta":"keep"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        assert_eq!(archive.len(), 1);
+        let kept = archive.by_index(0).unwrap();
+        assert_eq!(kept.name(), "model_info.json");
+    }
+
+    #[test]
+    fn skips_rewrite_when_no_deletions() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("skip.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("x.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let meta_before = fs::metadata(&zip_path).unwrap();
+        let mtime_before = FileTime::from_last_modification_time(&meta_before);
+
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+
+        let meta_after = fs::metadata(&zip_path).unwrap();
+        let mtime_after = FileTime::from_last_modification_time(&meta_after);
+        assert_eq!(mtime_before, mtime_after);
+    }
+
+    #[test]
+    fn preserves_directory_mtime_after_tmp_creation() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("dirtime.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("e.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let meta_before = fs::metadata(dir.path()).unwrap();
+        let mtime_before = FileTime::from_last_modification_time(&meta_before);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let cancel = AtomicBool::new(false);
+        process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+
+        let meta_after = fs::metadata(dir.path()).unwrap();
+        let mtime_after = FileTime::from_last_modification_time(&meta_after);
+        assert_eq!(mtime_before, mtime_after);
+    }
+
+    #[test]
+    fn cache_skips_same_zip_and_keyword() {
+        let dir = tempdir().unwrap();
+
+        let zip_path = dir.path().join("x.zip");
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("a.json", opts).unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
+        writer.finish().unwrap();
+
+        let meta = fs::metadata(&zip_path).unwrap();
+        let hash = zip_hash(&zip_path, &meta);
+        let mut cache = CacheMap::new();
+        cache_insert(&mut cache, "cat", &zip_path, hash);
+
+        assert!(cache_hit(&cache, "cat", &zip_path, &zip_hash(&zip_path, &meta)));
+        assert!(!cache_hit(&cache, "dog", &zip_path, &zip_hash(&zip_path, &meta)));
     }
 
     fn make_png_with_prompt(prompt: &str) -> Vec<u8> {
