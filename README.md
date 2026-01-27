@@ -19,6 +19,7 @@ cargo build --release
 ```
 
 The binary will be at `target/release/delete_images_from_zips`.
+Windows binary can be downloaded from the GitHub Releases page.
 
 ## Usage
 ```bash
