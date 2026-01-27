@@ -111,8 +111,13 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         if progress {
             eprintln!();
         }
-        process_zip(path, &keywords, progress, &cancel)?;
-        cache_insert(&mut cache, &keyword_key, path, zip_hash);
+        let changed = process_zip(path, &keywords, progress, &cancel)?;
+        let final_hash = if changed {
+            file_sha256(path)?
+        } else {
+            zip_hash
+        };
+        cache_insert(&mut cache, &keyword_key, path, final_hash);
         save_cache(&cache_path, &cache)?;
     }
     Ok(())
@@ -132,7 +137,7 @@ fn process_zip(
     keywords: &[String],
     progress: bool,
     cancel: &AtomicBool,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let meta = io_ctx(path, fs::metadata(path))?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
@@ -196,7 +201,7 @@ fn process_zip(
             finalize_no_deletions(b, entries.len() as u64);
         }
     set_times(path, atime, mtime)?;
-        return Ok(());
+        return Ok(false);
     }
     if let Some(ref b) = read_bar {
         let kept_len = entries.len() as u64 - deletions.len() as u64;
@@ -223,7 +228,7 @@ fn process_zip(
         // WHY: tmp作成やrenameで更新されたディレクトリ日時を元に戻す
         let _ = set_times(&dir_path, dir_atime, dir_mtime);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn write_filtered_zip(
@@ -762,6 +767,20 @@ fn zip_hash(path: &Path, meta: &fs::Metadata) -> String {
     to_hex(&out)
 }
 
+fn file_sha256(path: &Path) -> Result<String, AppError> {
+    let mut file = io_ctx(path, File::open(path))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(to_hex(&hasher.finalize()))
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -873,7 +892,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -898,7 +918,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -925,7 +946,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(!changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -952,7 +974,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(!changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -979,7 +1002,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -1014,7 +1038,8 @@ mod tests {
         writer.finish().unwrap();
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["anthro".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["anthro".into()], false, &cancel).unwrap();
+        assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
         let archive = ZipArchive::new(file).unwrap();
@@ -1041,7 +1066,8 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+        assert!(!changed);
 
         let meta_after = fs::metadata(&zip_path).unwrap();
         let mtime_after = FileTime::from_last_modification_time(&meta_after);
@@ -1128,7 +1154,8 @@ mod tests {
         let mtime_before = FileTime::from_last_modification_time(&meta_before);
 
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["dog".into()], false, &cancel).unwrap();
+        assert!(!changed);
 
         let meta_after = fs::metadata(&zip_path).unwrap();
         let mtime_after = FileTime::from_last_modification_time(&meta_after);
@@ -1154,7 +1181,8 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+        let changed = process_zip(&zip_path, &vec!["cat".into()], false, &cancel).unwrap();
+        assert!(changed);
 
         let meta_after = fs::metadata(dir.path()).unwrap();
         let mtime_after = FileTime::from_last_modification_time(&meta_after);
