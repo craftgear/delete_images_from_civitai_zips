@@ -107,7 +107,7 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
                 eprintln!(
                     "{} {}",
                     color_msg(&name, "1;37"),
-                    color_msg("skipped (cached)", "90")
+                    color_msg("skipped (processed)", "90")
                 );
             }
             continue;
