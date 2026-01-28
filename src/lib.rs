@@ -115,22 +115,14 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         if progress {
             eprintln!();
         }
-        let changed = match process_zip(path, &keywords, progress, &cancel) {
-            Ok(v) => v,
+        match process_zip(path, &keywords, progress, &cancel) {
+            Ok(_changed) => {}
             Err(e) => {
                 errors.push((path.clone(), e));
                 continue;
             }
-        };
-        let final_hash = if changed {
-            if progress {
-                let name = file_display_name(path);
-                eprintln!("{} {}", color_msg(&name, "1;37"), color_msg("hashing...", "90"));
-            }
-            file_sha256(path)?
-        } else {
-            zip_hash
-        };
+        }
+        let final_hash = zip_hash;
         cache_insert(&mut cache, &keyword_key, path, final_hash);
         save_cache(&cache_path, &cache)?;
     }
@@ -794,20 +786,6 @@ fn zip_hash(path: &Path, meta: &fs::Metadata) -> String {
     to_hex(&out)
 }
 
-fn file_sha256(path: &Path) -> Result<String, AppError> {
-    let mut file = io_ctx(path, File::open(path))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(to_hex(&hasher.finalize()))
-}
-
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -1340,43 +1318,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_caches_written_hash() {
-        let _guard = env_guard();
-        let dir = tempdir().unwrap();
-        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
-        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
-
-        let zip_path = dir.path().join("only.zip");
-        let mut zip_file = File::create(&zip_path).unwrap();
-        let mut writer = ZipWriter::new(&mut zip_file);
-        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
-        writer.start_file("a.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
-        writer.finish().unwrap();
-
-        run(dir.path(), "cat", false).unwrap();
-
-        let cache = load_cache(&cache_file_path());
-        let keyword_key = keyword_key(&vec!["cat".into()]);
-        let key = zip_path.display().to_string();
-        let stored = cache
-            .get(&keyword_key)
-            .and_then(|m| m.get(&key))
-            .cloned();
-        let content_hash = file_sha256(&zip_path).unwrap();
-        let meta = fs::metadata(&zip_path).unwrap();
-        let fast_hash = zip_hash(&zip_path, &meta);
-        assert_eq!(stored, Some(content_hash));
-        assert_ne!(stored, Some(fast_hash));
-
-        match prev {
-            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
-            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
-        }
-    }
 
     #[test]
     fn path_len_warning_returns_none_for_short_path() {
