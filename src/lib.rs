@@ -485,8 +485,8 @@ fn decide_deletions(
     }
 
     if let Some(b) = bar {
-        // WHY: 解析完了を明確に伝えるため
-        b.finish_with_message(color_msg("analysis done", "36"));
+        // WHY: 次の行に進ませないため表示行を消す
+        b.finish_and_clear();
     }
 
     for (stem, prompt_opt) in json_prompts.iter() {
