@@ -103,10 +103,7 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         let zip_hash = zip_hash(path, &meta);
         if cache_hit(&cache, &keyword_key, path, &zip_hash) {
             if progress {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
+                let name = file_display_name(path);
                 eprintln!(
                     "{} {}",
                     color_msg(&name, "1;37"),
@@ -126,6 +123,10 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
             }
         };
         let final_hash = if changed {
+            if progress {
+                let name = file_display_name(path);
+                eprintln!("{} {}", color_msg(&name, "1;37"), color_msg("hashing...", "90"));
+            }
             file_sha256(path)?
         } else {
             zip_hash
@@ -181,10 +182,7 @@ fn process_zip(
                     .unwrap()
                     .progress_chars("=>-"),
             );
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
+            let name = file_display_name(path);
             b.set_prefix(color_msg(&name, "1;37"));
             b.set_message(color_msg("scanning", "36"));
             Some(b)
@@ -525,6 +523,12 @@ fn parse_keywords(csv: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn file_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn entry_meta_from_name(name: &str) -> Result<EntryMeta, AppError> {
@@ -1280,6 +1284,26 @@ mod tests {
     }
 
     #[test]
+    fn file_display_name_uses_file_name() {
+        let path = Path::new("/tmp/sample.zip");
+        assert_eq!(file_display_name(path), "sample.zip");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_display_name_falls_back_unix_root() {
+        let path = Path::new("/");
+        assert_eq!(file_display_name(path), "/");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_display_name_falls_back_windows_root() {
+        let path = Path::new("C:\\");
+        assert_eq!(file_display_name(path), "C:\\");
+    }
+
+    #[test]
     fn run_skips_errors_and_reports() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
@@ -1304,12 +1328,49 @@ mod tests {
 
         let cache = load_cache(&cache_file_path());
         let keyword_key = keyword_key(&vec!["cat".into()]);
-        assert!(cache_hit(
-            &cache,
-            &keyword_key,
-            &good,
-            &file_sha256(&good).unwrap()
-        ));
+        let key = good.display().to_string();
+        assert!(cache
+            .get(&keyword_key)
+            .and_then(|m| m.get(&key))
+            .is_some());
+
+        match prev {
+            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
+            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
+        }
+    }
+
+    #[test]
+    fn run_caches_written_hash() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
+        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
+
+        let zip_path = dir.path().join("only.zip");
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file("a.json", opts).unwrap();
+        writer
+            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+
+        run(dir.path(), "cat", false).unwrap();
+
+        let cache = load_cache(&cache_file_path());
+        let keyword_key = keyword_key(&vec!["cat".into()]);
+        let key = zip_path.display().to_string();
+        let stored = cache
+            .get(&keyword_key)
+            .and_then(|m| m.get(&key))
+            .cloned();
+        let content_hash = file_sha256(&zip_path).unwrap();
+        let meta = fs::metadata(&zip_path).unwrap();
+        let fast_hash = zip_hash(&zip_path, &meta);
+        assert_eq!(stored, Some(content_hash));
+        assert_ne!(stored, Some(fast_hash));
 
         match prev {
             Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
