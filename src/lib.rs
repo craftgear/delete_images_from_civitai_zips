@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -22,6 +22,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use signal_hook::consts::SIGINT;
 use signal_hook::flag as signal_flag;
+use sysinfo::System;
 use thiserror::Error;
 use webp::{Encoder as WebpEncoder, WebPConfig};
 use walkdir::WalkDir;
@@ -106,6 +107,7 @@ struct ConversionPlan {
     target_names: HashSet<String>,
 }
 
+#[derive(Clone)]
 struct ConversionEntry {
     target_name: String,
     has_json: bool,
@@ -130,6 +132,79 @@ struct PreparedConversion {
     target_name: String,
     original_bytes: Vec<u8>,
     outcome: ConversionOutcome,
+}
+
+struct ConversionInputIter {
+    archive: ZipArchive<File>,
+    index: usize,
+    zip_path_display: String,
+    plan_by_png: Arc<HashMap<String, ConversionEntry>>,
+    deletions: Arc<HashSet<String>>,
+}
+
+impl ConversionInputIter {
+    fn new(
+        archive: ZipArchive<File>,
+        zip_path_display: String,
+        plan_by_png: Arc<HashMap<String, ConversionEntry>>,
+        deletions: Arc<HashSet<String>>,
+    ) -> Self {
+        Self {
+            archive,
+            index: 0,
+            zip_path_display,
+            plan_by_png,
+            deletions,
+        }
+    }
+}
+
+impl Iterator for ConversionInputIter {
+    type Item = Result<ConversionInput, AppError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.archive.len() {
+            let i = self.index;
+            self.index += 1;
+            let mut file = match self.archive.by_index(i) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Some(Err(AppError::ZipWithPath {
+                        path: self.zip_path_display.clone(),
+                        source: e,
+                    }))
+                }
+            };
+            if file.name().ends_with('/') {
+                continue;
+            }
+            let name = file.name().to_string();
+            if self.deletions.contains(&name) {
+                continue;
+            }
+            let Some(info) = self.plan_by_png.get(&name) else {
+                continue;
+            };
+            let bytes = match read_zipfile_bytes(&mut file) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let text_chunks = png_text_chunks(&bytes);
+            let stem = match entry_meta_from_name(&name) {
+                Ok(meta) => meta.stem,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(Ok(ConversionInput {
+                name,
+                stem,
+                target_name: info.target_name.clone(),
+                has_json: info.has_json,
+                bytes,
+                text_chunks,
+            }));
+        }
+        None
+    }
 }
 
 
@@ -394,6 +469,80 @@ fn process_zip(
     Ok(true)
 }
 
+fn write_zip_entries<W: Write + Seek>(
+    path: &Path,
+    writer: &mut zip::ZipWriter<W>,
+    src: &mut ZipArchive<File>,
+    deletions: &HashSet<String>,
+    prepared_conversions: Option<&PreparedConversions>,
+    skip_stems: Option<&HashSet<String>>,
+    convert_targets: Option<&HashSet<String>>,
+    entry_stems: &HashMap<String, String>,
+    entry_kinds: &HashMap<String, EntryKind>,
+    bar: Option<&ProgressBar>,
+    progress_info: &ProgressInfo,
+    cancel: &AtomicBool,
+) -> Result<(), AppError> {
+    for i in 0..src.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AppError::Interrupted);
+        }
+        let file = src
+            .by_index(i)
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+        if file.name().ends_with('/') {
+            continue;
+        }
+        let name = file.name().to_string();
+        if let Some(skip) = skip_stems {
+            if let Some(kind) = entry_kinds.get(&name) {
+                if matches!(kind, EntryKind::Png | EntryKind::Json) {
+                    let stem = entry_stems
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            entry_meta_from_name(&name)
+                                .map(|m| m.stem)
+                                .unwrap_or(name.clone())
+                        });
+                    if skip.contains(&stem) {
+                        advance_progress(bar, progress_info);
+                        continue;
+                    }
+                }
+            }
+        }
+        if deletions.contains(&name) {
+            continue;
+        }
+        if let Some(targets) = convert_targets {
+            if targets.contains(&name) {
+                continue;
+            }
+        }
+        if let Some(ref prepared) = prepared_conversions {
+            if let Some(entry) = prepared.conversions.get(&name) {
+                let opts = file_options_for_write(&file);
+                match &entry.outcome {
+                    ConversionOutcome::Converted(bytes) => {
+                        writer.start_file(&entry.target_name, opts)?;
+                        writer.write_all(bytes)?;
+                    }
+                    ConversionOutcome::KeepOriginal => {
+                        writer.start_file(&name, opts)?;
+                        writer.write_all(&entry.original_bytes)?;
+                    }
+                }
+                advance_progress(bar, progress_info);
+                continue;
+            }
+        }
+        writer.raw_copy_file(file)?;
+        advance_progress(bar, progress_info);
+    }
+    Ok(())
+}
+
 fn write_filtered_zip(
     path: &Path,
     progress_info: &ProgressInfo,
@@ -412,7 +561,9 @@ fn write_filtered_zip(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let orig_permissions = io_ctx(path, fs::metadata(&io_path(path)))?.permissions();
+    let meta = io_ctx(path, fs::metadata(&io_path(path)))?;
+    let zip_size = meta.len();
+    let orig_permissions = meta.permissions();
     let prepared_conversions = match conversion_plan {
         Some(plan) => Some(prepare_conversions(
             path,
@@ -437,122 +588,113 @@ fn write_filtered_zip(
         b.tick();
     }
 
-    let mut tmp = Builder::new()
-        .prefix("civitai_tmp")
-        .suffix(".zip")
-        .tempfile_in(dir)?;
+    let buf_size = env::var("BUF_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * (1 << 20))
+        .unwrap_or(16 * (1 << 20));
 
-    // WHY: 一時ファイルの作成日時を元ZIPに合わせ、後工程でのタイムスタンプ差異を減らす
-    set_times(tmp.path(), atime, mtime)?;
+    if let Some(b) = bar {
+        b.tick(); // WHY: 0件書き込みでもバーを一度描画するため
+    }
 
-    {
-        let buf_size = env::var("BUF_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|mb| mb * (1 << 20))
-            .unwrap_or(16 * (1 << 20));
+    // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
+    let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+    let convert_targets = conversion_plan.map(|p| &p.target_names);
+    let entry_stems = build_entry_stems(entries);
+    let entry_kinds = build_entry_kinds(entries);
+    let skip_stems = prepared_conversions
+        .as_ref()
+        .map(|prepared| &prepared.skip_stems);
 
-        // WHY: HDD/遅いストレージ向けに書き込み呼び出し回数をさらに減らす
-        // WHY: BUF_MBで可変にしベンチしやすくする
-        let buf = BufWriter::with_capacity(buf_size, tmp.as_file_mut());
+    let use_memory = should_write_in_memory(zip_size, available_memory_bytes());
+    if use_memory {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let buf = BufWriter::with_capacity(buf_size, cursor);
         let mut writer = zip::ZipWriter::new(buf);
-        if let Some(b) = bar {
-            b.tick(); // WHY: 0件書き込みでもバーを一度描画するため
+        write_zip_entries(
+            path,
+            &mut writer,
+            &mut src,
+            deletions,
+            prepared_conversions.as_ref(),
+            skip_stems,
+            convert_targets,
+            &entry_stems,
+            &entry_kinds,
+            bar,
+            progress_info,
+            cancel,
+        )?;
+        let buf = writer.finish()?;
+        let cursor = buf
+            .into_inner()
+            .map_err(|e| AppError::Io(e.into_error()))?;
+        let bytes = cursor.into_inner();
+        if io_path(path).exists() {
+            // WHY: Windows上書き問題回避
+            io_ctx(path, fs::remove_file(&io_path(path)))?;
         }
-        // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
-        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
-        let convert_targets = conversion_plan.map(|p| &p.target_names);
-        let entry_stems = build_entry_stems(entries);
-        let entry_kinds = build_entry_kinds(entries);
-        let skip_stems = prepared_conversions
-            .as_ref()
-            .map(|prepared| &prepared.skip_stems);
-        for i in 0..src.len() {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(AppError::Interrupted);
-            }
-            let file = src
-                .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
-            if file.name().ends_with('/') {
-                continue;
-            }
-            let name = file.name().to_string();
-            if let Some(skip) = skip_stems {
-                if let Some(kind) = entry_kinds.get(&name) {
-                    if matches!(kind, EntryKind::Png | EntryKind::Json) {
-                        let stem = entry_stems
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                entry_meta_from_name(&name)
-                                    .map(|m| m.stem)
-                                    .unwrap_or(name.clone())
-                            });
-                        if skip.contains(&stem) {
-                            advance_progress(bar, progress_info);
-                            continue;
-                        }
-                    }
-                }
-            }
-            if deletions.contains(&name) {
-                continue;
-            }
-            if let Some(targets) = convert_targets {
-                if targets.contains(&name) {
-                    continue;
-                }
-            }
-            if let Some(ref prepared) = prepared_conversions {
-                if let Some(entry) = prepared.conversions.get(&name) {
-                    let opts = file_options_for_write(&file);
-                    match &entry.outcome {
-                        ConversionOutcome::Converted(bytes) => {
-                            writer.start_file(&entry.target_name, opts)?;
-                            writer.write_all(bytes)?;
-                        }
-                        ConversionOutcome::KeepOriginal => {
-                            writer.start_file(&name, opts)?;
-                            writer.write_all(&entry.original_bytes)?;
-                        }
-                    }
-                    advance_progress(bar, progress_info);
-                    continue;
-                }
-            }
-            writer.raw_copy_file(file)?;
-            advance_progress(bar, progress_info);
+        io_ctx(path, fs::write(&io_path(path), bytes))?;
+        io_ctx(
+            path,
+            fs::set_permissions(&io_path(path), orig_permissions.clone()),
+        )?;
+    } else {
+        let mut tmp = Builder::new()
+            .prefix("civitai_tmp")
+            .suffix(".zip")
+            .tempfile_in(dir)?;
+
+        // WHY: 一時ファイルの作成日時を元ZIPに合わせ、後工程でのタイムスタンプ差異を減らす
+        set_times(tmp.path(), atime, mtime)?;
+
+        {
+            // WHY: HDD/遅いストレージ向けに書き込み呼び出し回数をさらに減らす
+            // WHY: BUF_MBで可変にしベンチしやすくする
+            let buf = BufWriter::with_capacity(buf_size, tmp.as_file_mut());
+            let mut writer = zip::ZipWriter::new(buf);
+            write_zip_entries(
+                path,
+                &mut writer,
+                &mut src,
+                deletions,
+                prepared_conversions.as_ref(),
+                skip_stems,
+                convert_targets,
+                &entry_stems,
+                &entry_kinds,
+                bar,
+                progress_info,
+                cancel,
+            )?;
+            writer.finish()?;
         }
-        writer.finish()?;
+
+        // WHY: 書き込み後のfsyncコストを避けるため、renameベースで差し替える
+        io_ctx(
+            tmp.path(),
+            fs::set_permissions(&io_path(tmp.path()), orig_permissions.clone()),
+        )?;
+
+        if io_path(path).exists() {
+            // WHY: Windows上書き問題回避
+            io_ctx(path, fs::remove_file(&io_path(path)))?;
+        }
+        let persist_result = tmp.persist(&io_path(path));
+        if let Err(err) = persist_result {
+            return Err(AppError::IoWithPath {
+                path: display_path(path),
+                source: err.error,
+            });
+        }
     }
 
     if let Some(b) = bar {
         // WHY: syncやタイムスタンプ復元など後処理中であることを示すため
         b.set_message(color_msg("finalizing", "90"));
         b.tick();
-    }
-
-    // WHY: 書き込み後のfsyncコストを避けるため、renameベースで差し替える
-    io_ctx(
-        tmp.path(),
-        fs::set_permissions(&io_path(tmp.path()), orig_permissions.clone()),
-    )?;
-
-    if io_path(path).exists() {
-        // WHY: Windows上書き問題回避
-        io_ctx(path, fs::remove_file(&io_path(path)))?;
-    }
-    let persist_result = tmp.persist(&io_path(path));
-    if let Err(err) = persist_result {
-        return Err(AppError::IoWithPath {
-            path: display_path(path),
-            source: err.error,
-        });
-    }
-
-    if let Some(b) = bar {
         if kept_len == 0 {
             // WHY: 全削除時も書き込みフェーズを完了表示にするため
             if let Some(len) = b.length() {
@@ -573,39 +715,9 @@ fn prepare_conversions(
     bar: Option<&ProgressBar>,
     progress_info: &ProgressInfo,
 ) -> Result<PreparedConversions, AppError> {
-    let mut archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+    let archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
         .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
-    let mut inputs = Vec::new();
-    for i in 0..archive.len() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::Interrupted);
-        }
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
-        if file.name().ends_with('/') {
-            continue;
-        }
-        let name = file.name().to_string();
-        if deletions.contains(&name) {
-            continue;
-        }
-        let Some(info) = plan.by_png.get(&name) else {
-            continue;
-        };
-        let bytes = read_zipfile_bytes(&mut file)?;
-        let text_chunks = png_text_chunks(&bytes);
-        let stem = entry_meta_from_name(&name)?.stem;
-        inputs.push(ConversionInput {
-            name,
-            stem,
-            target_name: info.target_name.clone(),
-            has_json: info.has_json,
-            bytes,
-            text_chunks,
-        });
-    }
-    if inputs.is_empty() {
+    if plan.by_png.is_empty() {
         return Ok(PreparedConversions {
             conversions: HashMap::new(),
             skip_stems: HashSet::new(),
@@ -613,7 +725,7 @@ fn prepare_conversions(
         });
     }
     if let Some(b) = bar {
-        b.set_length(inputs.len() as u64);
+        b.set_length(plan.by_png.len() as u64);
         b.set_position(0);
         reset_scroll_base(progress_info);
         b.set_prefix(color_msg(&progress_prefix(progress_info, 0), "1;37"));
@@ -626,10 +738,15 @@ fn prepare_conversions(
         start_prefix_ticker(b, info, ticker_stop.clone())
     });
     let format = plan.format;
-    // WHY: 画像変換はCPU負荷が高いため先に並列化して待ち時間を減らす
-    let results = inputs
-        .into_par_iter()
+    let zip_path_display = display_path(path);
+    let plan_by_png = Arc::new(plan.by_png.clone());
+    let deletions = Arc::new(deletions.clone());
+    let input_iter = ConversionInputIter::new(archive, zip_path_display, plan_by_png, deletions);
+    // WHY: 読み込みは逐次にしつつ変換だけを並列化して待ち時間を減らす
+    let results = input_iter
+        .par_bridge()
         .map(|input| {
+            let input = input?;
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
@@ -645,7 +762,7 @@ fn prepare_conversions(
             }
             Ok((input, outcome))
         })
-        .collect::<Result<Vec<_>, AppError>>(); 
+        .collect::<Result<Vec<_>, AppError>>();
     ticker_stop.store(true, Ordering::Relaxed);
     if let Some(handle) = ticker_handle {
         let _ = handle.join();
@@ -2024,6 +2141,20 @@ fn conversion_parallel_threads(convert: Option<ConvertFormat>) -> usize {
     }
 }
 
+const MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn available_memory_bytes() -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_memory();
+    Some(system.available_memory())
+}
+
+fn should_write_in_memory(zip_size: u64, free_bytes: Option<u64>) -> bool {
+    free_bytes
+        .map(|free| free >= zip_size.saturating_add(MEMORY_MARGIN_BYTES))
+        .unwrap_or(false)
+}
+
 fn path_len_warning(path: &Path) -> Option<String> {
     let _ = path;
     // WHY: パス長警告は出さない方針に変更した
@@ -2335,6 +2466,25 @@ mod tests {
     #[test]
     fn conversion_parallel_threads_uses_fixed_for_jxl() {
         assert_eq!(conversion_parallel_threads(Some(ConvertFormat::Jxl)), 4);
+    }
+
+    #[test]
+    fn should_write_in_memory_when_free_is_enough() {
+        let zip_size = 10 * 1024 * 1024;
+        let free = Some(zip_size + MEMORY_MARGIN_BYTES + 1);
+        assert!(should_write_in_memory(zip_size, free));
+    }
+
+    #[test]
+    fn should_not_write_in_memory_when_free_is_small() {
+        let zip_size = 10 * 1024 * 1024;
+        let free = Some(zip_size + MEMORY_MARGIN_BYTES - 1);
+        assert!(!should_write_in_memory(zip_size, free));
+    }
+
+    #[test]
+    fn should_not_write_in_memory_when_free_is_unknown() {
+        assert!(!should_write_in_memory(1, None));
     }
 
     #[test]

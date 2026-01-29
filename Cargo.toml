@@ -20,6 +20,7 @@ regex = "1.10"
 indicatif = "0.17"
 signal-hook = "0.3"
 sha2 = "0.10"
+sysinfo = "0.30"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 jpegxl-rs = { version = "0.12.0", default-features = false, features = ["vendored"] }
 webp = { version = "0.3.1", default-features = false }
