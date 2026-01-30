@@ -41,7 +41,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: delete_images_from_zips-windows
-          path: target/release/delete_images_from_zips.exe
+          path: target/release/delete_or_convert_images_from_civitai_zips.exe
 
       - name: Set release tag
         if: github.event_name == 'push'
@@ -56,7 +56,7 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: Auto release ${{ env.RELEASE_TAG }}
           make_latest: true
-          files: target/release/delete_images_from_zips.exe
+          files: target/release/delete_or_convert_images_from_civitai_zips.exe
 
       - name: Delete old releases and tags
         if: github.event_name == 'push'
