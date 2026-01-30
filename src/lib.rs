@@ -128,10 +128,16 @@ struct PreparedConversions {
     skips: Vec<ConversionSkip>,
 }
 
+struct WorkflowOutput {
+    target_name: String,
+    bytes: Vec<u8>,
+}
+
 struct PreparedConversion {
     target_name: String,
     original_bytes: Vec<u8>,
     outcome: ConversionOutcome,
+    workflow_output: Option<WorkflowOutput>,
 }
 
 struct ConversionInputIter {
@@ -533,6 +539,10 @@ fn write_zip_entries<W: Write + Seek>(
                         writer.write_all(&entry.original_bytes)?;
                     }
                 }
+                if let Some(workflow) = &entry.workflow_output {
+                    writer.start_file(&workflow.target_name, opts)?;
+                    writer.write_all(&workflow.bytes)?;
+                }
                 advance_progress(bar, progress_info);
                 continue;
             }
@@ -601,7 +611,22 @@ fn write_filtered_zip(
     // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
     let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
         .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
-    let convert_targets = conversion_plan.map(|p| &p.target_names);
+    let mut skip_targets = HashSet::new();
+    if let Some(plan) = conversion_plan {
+        skip_targets.extend(plan.target_names.iter().cloned());
+    }
+    if let Some(prepared) = prepared_conversions.as_ref() {
+        for conversion in prepared.conversions.values() {
+            if let Some(workflow) = &conversion.workflow_output {
+                skip_targets.insert(workflow.target_name.clone());
+            }
+        }
+    }
+    let convert_targets = if skip_targets.is_empty() {
+        None
+    } else {
+        Some(&skip_targets)
+    };
     let entry_stems = build_entry_stems(entries);
     let entry_kinds = build_entry_kinds(entries);
     let skip_stems = prepared_conversions
@@ -774,12 +799,14 @@ fn prepare_conversions(
     for (input, outcome) in results {
         match outcome {
             ConversionAttempt::Outcome(outcome) => {
+                let workflow_output = build_workflow_output(&input.name, &input.text_chunks)?;
                 map.insert(
                     input.name,
                     PreparedConversion {
                         target_name: input.target_name,
                         original_bytes: input.bytes,
                         outcome,
+                        workflow_output,
                     },
                 );
             }
@@ -1500,6 +1527,39 @@ fn replace_extension(name: &str, ext: &str) -> Result<String, AppError> {
     }
 }
 
+fn workflow_json_name(name: &str) -> Result<String, AppError> {
+    replace_extension(name, "comfyui-workflow.json")
+}
+
+fn extract_comfyui_workflow_json(text_chunks: &[(String, String)]) -> Option<String> {
+    text_chunks
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("workflow"))
+        .map(|(_, value)| value.clone())
+}
+
+fn build_workflow_output(
+    name: &str,
+    text_chunks: &[(String, String)],
+) -> Result<Option<WorkflowOutput>, AppError> {
+    let raw = match extract_comfyui_workflow_json(text_chunks) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+        return Ok(None);
+    }
+    let target_name = workflow_json_name(name)?;
+    Ok(Some(WorkflowOutput {
+        target_name,
+        bytes: raw.into_bytes(),
+    }))
+}
+
 enum ConversionOutcome {
     Converted(Vec<u8>),
     KeepOriginal,
@@ -2135,8 +2195,7 @@ fn conversion_parallel_threads(convert: Option<ConvertFormat>) -> usize {
         .map(|count| count.get())
         .unwrap_or(1);
     if matches!(convert, Some(ConvertFormat::Jxl)) {
-        // WHY: JXL側で内部並列を使うためレイオンは固定値で抑える
-        4
+        cores
     } else {
         // WHY: WebP/JPEGのエンコードは内部並列がないためCPUコア数を使う
         cores
@@ -2272,6 +2331,81 @@ mod tests {
 
         let features = BitstreamFeatures::new(&webp_bytes).unwrap();
         assert!(matches!(features.format(), Some(BitstreamFormat::Lossy)));
+    }
+
+    #[test]
+    fn exports_comfyui_workflow_json_when_converting() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let workflow = r#"{"version":1,"nodes":[],"links":[]}"#;
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("a.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_text_chunks(&[
+                ("prompt", "cat"),
+                ("workflow", workflow),
+            ]))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let progress_info = test_progress_info(&zip_path);
+        let cancel = AtomicBool::new(false);
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            Some(ConvertFormat::Webp),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let mut workflow_file = archive.by_name("a.comfyui-workflow.json").unwrap();
+        let workflow_bytes = read_zipfile_bytes(&mut workflow_file).unwrap();
+        assert_eq!(String::from_utf8_lossy(&workflow_bytes), workflow);
+    }
+
+    #[test]
+    fn does_not_export_workflow_json_when_missing() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("a.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_text_chunks(&[("prompt", "cat")]))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let progress_info = test_progress_info(&zip_path);
+        let cancel = AtomicBool::new(false);
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            Some(ConvertFormat::Webp),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(!names.contains(&"a.comfyui-workflow.json".to_string()));
     }
 
     #[test]
@@ -2466,8 +2600,11 @@ mod tests {
     }
 
     #[test]
-    fn conversion_parallel_threads_uses_fixed_for_jxl() {
-        assert_eq!(conversion_parallel_threads(Some(ConvertFormat::Jxl)), 4);
+    fn conversion_parallel_threads_uses_available_for_jxl() {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        assert_eq!(conversion_parallel_threads(Some(ConvertFormat::Jxl)), cores);
     }
 
     #[test]
