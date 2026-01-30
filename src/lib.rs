@@ -12,7 +12,7 @@ use filetime::{set_file_times, FileTime};
 use indicatif::{ProgressBar, ProgressStyle};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageFormat};
-use jpegxl_rs::encode::{EncoderFrame, JxlEncoder, Metadata as JxlMetadata};
+use jpegxl_rs::encode::{EncoderFrame, JxlEncoder};
 use jpegxl_rs::encode::EncoderSpeed;
 use jpegxl_rs::encoder_builder as jxl_encoder_builder;
 use jpegxl_rs::parallel::ParallelRunner;
@@ -110,14 +110,12 @@ struct ConversionPlan {
 #[derive(Clone)]
 struct ConversionEntry {
     target_name: String,
-    has_json: bool,
 }
 
 struct ConversionInput {
     name: String,
     stem: String,
     target_name: String,
-    has_json: bool,
     bytes: Vec<u8>,
     text_chunks: Vec<(String, String)>,
 }
@@ -204,7 +202,6 @@ impl Iterator for ConversionInputIter {
                 name,
                 stem,
                 target_name: info.target_name.clone(),
-                has_json: info.has_json,
                 bytes,
                 text_chunks,
             }));
@@ -740,8 +737,6 @@ fn prepare_conversions(
     bar: Option<&ProgressBar>,
     progress_info: &ProgressInfo,
 ) -> Result<PreparedConversions, AppError> {
-    let archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
     if plan.by_png.is_empty() {
         return Ok(PreparedConversions {
             conversions: HashMap::new(),
@@ -749,6 +744,14 @@ fn prepare_conversions(
             skips: Vec::new(),
         });
     }
+    let meta = io_ctx(path, fs::metadata(&io_path(path)))?;
+    let zip_size = meta.len();
+    if should_read_in_memory(zip_size, available_memory_bytes()) {
+        // WHY: 空きメモリがある場合は展開して並列読み取りを優先する
+        return prepare_conversions_from_memory(path, plan, cancel, bar, progress_info);
+    }
+    let archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
     if let Some(b) = bar {
         b.set_length(plan.by_png.len() as u64);
         b.set_position(0);
@@ -779,8 +782,6 @@ fn prepare_conversions(
                 &input.name,
                 &input.bytes,
                 format,
-                &input.text_chunks,
-                input.has_json,
             )?;
             if let Some(b) = bar {
                 b.inc(1);
@@ -793,6 +794,76 @@ fn prepare_conversions(
         let _ = handle.join();
     }
     let results = results?;
+    collect_prepared_conversions(results)
+}
+
+fn prepare_conversions_from_memory(
+    path: &Path,
+    plan: &ConversionPlan,
+    cancel: &AtomicBool,
+    bar: Option<&ProgressBar>,
+    progress_info: &ProgressInfo,
+) -> Result<PreparedConversions, AppError> {
+    let zip_bytes = io_ctx(path, fs::read(&io_path(path)))?;
+    let zip_bytes = Arc::new(zip_bytes);
+    if let Some(b) = bar {
+        b.set_length(plan.by_png.len() as u64);
+        b.set_position(0);
+        reset_scroll_base(progress_info);
+        b.set_prefix(color_msg(&progress_prefix(progress_info, 0), "1;37"));
+        b.set_message(color_msg("converting", "36"));
+        b.tick();
+    }
+    let ticker_stop = Arc::new(AtomicBool::new(false));
+    let ticker_handle = bar.map(|b| {
+        let info = progress_info_for_ticker(progress_info);
+        start_prefix_ticker(b, info, ticker_stop.clone())
+    });
+    let format = plan.format;
+    let zip_path_display = display_path(path);
+    let results = plan
+        .by_png
+        .par_iter()
+        .map(|(name, entry)| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let bytes = read_zip_entry_bytes_from_memory(
+                &zip_path_display,
+                zip_bytes.as_slice(),
+                name,
+            )?;
+            let text_chunks = png_text_chunks(&bytes);
+            let stem = entry_meta_from_name(name)?.stem;
+            let input = ConversionInput {
+                name: name.clone(),
+                stem,
+                target_name: entry.target_name.clone(),
+                bytes,
+                text_chunks,
+            };
+            let outcome = convert_png_for_format_with_skip(
+                &input.name,
+                &input.bytes,
+                format,
+            )?;
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+            Ok((input, outcome))
+        })
+        .collect::<Result<Vec<_>, AppError>>();
+    ticker_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = ticker_handle {
+        let _ = handle.join();
+    }
+    let results = results?;
+    collect_prepared_conversions(results)
+}
+
+fn collect_prepared_conversions(
+    results: Vec<(ConversionInput, ConversionAttempt)>,
+) -> Result<PreparedConversions, AppError> {
     let mut map = HashMap::with_capacity(results.len());
     let mut skip_stems = HashSet::new();
     let mut skips = Vec::new();
@@ -836,12 +907,6 @@ fn build_conversion_plan(
     deletions: &HashSet<String>,
     format: ConvertFormat,
 ) -> Result<Option<ConversionPlan>, AppError> {
-    let json_stems: HashSet<String> = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Json))
-        .filter(|e| !deletions.contains(&e.name))
-        .map(|e| e.stem.clone())
-        .collect();
     let mut by_png = HashMap::new();
     let mut target_names = HashSet::new();
     for e in entries {
@@ -852,12 +917,10 @@ fn build_conversion_plan(
             continue;
         }
         let target_name = replace_extension(&e.name, convert_extension(format))?;
-        let has_json = json_stems.contains(&e.stem);
         by_png.insert(
             e.name.clone(),
             ConversionEntry {
                 target_name: target_name.clone(),
-                has_json,
             },
         );
         target_names.insert(target_name);
@@ -1213,6 +1276,25 @@ fn read_zipfile_bytes(file: &mut ZipFile) -> Result<Vec<u8>, AppError> {
     let mut data = Vec::with_capacity(file.size() as usize);
     file.read_to_end(&mut data)?;
     Ok(data)
+}
+
+fn read_zip_entry_bytes_from_memory(
+    zip_path_display: &str,
+    zip_bytes: &[u8],
+    name: &str,
+) -> Result<Vec<u8>, AppError> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut archive = ZipArchive::new(cursor).map_err(|e| AppError::ZipWithPath {
+        path: zip_path_display.to_string(),
+        source: e,
+    })?;
+    let mut file = archive
+        .by_name(name)
+        .map_err(|e| AppError::ZipWithPath {
+            path: zip_path_display.to_string(),
+            source: e,
+        })?;
+    read_zipfile_bytes(&mut file)
 }
 
 fn normalize_prompt(s: &str) -> Vec<String> {
@@ -1579,26 +1661,12 @@ struct ConversionSkip {
 fn convert_png_for_format(
     data: &[u8],
     format: ConvertFormat,
-    text_chunks: &[(String, String)],
-    has_json: bool,
 ) -> Result<ConversionOutcome, AppError> {
     match format {
-        ConvertFormat::Jxl => convert_png_to_jxl(data, text_chunks, has_json),
+        ConvertFormat::Jxl => convert_png_to_jxl(data),
         ConvertFormat::Webp | ConvertFormat::Jpeg => {
             let converted = convert_png_bytes_basic(data, format)?;
-            if text_chunks.is_empty() {
-                return Ok(ConversionOutcome::Converted(converted));
-            }
-            match embed_converted_metadata(&converted, format, text_chunks) {
-                Ok(with_meta) => Ok(ConversionOutcome::Converted(with_meta)),
-                Err(_) => {
-                    if has_json {
-                        Ok(ConversionOutcome::Converted(converted))
-                    } else {
-                        Ok(ConversionOutcome::KeepOriginal)
-                    }
-                }
-            }
+            Ok(ConversionOutcome::Converted(converted))
         }
     }
 }
@@ -1607,10 +1675,8 @@ fn convert_png_for_format_with_skip(
     name: &str,
     data: &[u8],
     format: ConvertFormat,
-    text_chunks: &[(String, String)],
-    has_json: bool,
 ) -> Result<ConversionAttempt, AppError> {
-    match convert_png_for_format(data, format, text_chunks, has_json) {
+    match convert_png_for_format(data, format) {
         Ok(outcome) => Ok(ConversionAttempt::Outcome(outcome)),
         Err(AppError::Image(err)) => {
             Ok(ConversionAttempt::Skipped(ConversionSkip {
@@ -1669,222 +1735,14 @@ fn convert_png_bytes_basic(data: &[u8], format: ConvertFormat) -> Result<Vec<u8>
     Ok(out)
 }
 
-fn build_xmp_packet(chunks: &[(String, String)]) -> String {
-    if chunks.is_empty() {
-        return String::new();
-    }
-    let mut text_body = String::new();
-    let mut prompt_value = None;
-    for (key, value) in chunks {
-        if prompt_value.is_none() && key.eq_ignore_ascii_case("prompt") {
-            prompt_value = Some(value.clone());
-        }
-        text_body.push_str("<civitai:text key=\"");
-        text_body.push_str(&xml_escape(key));
-        text_body.push_str("\">");
-        text_body.push_str(&xml_escape(value));
-        text_body.push_str("</civitai:text>");
-    }
-    let mut prompt_tag = String::new();
-    if let Some(prompt) = prompt_value {
-        prompt_tag.push_str("<prompt>");
-        prompt_tag.push_str(&xml_escape(&prompt));
-        prompt_tag.push_str("</prompt>");
-    }
-    format!(
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
-<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
-<rdf:Description xmlns:civitai=\"https://civitai.com/ns/1.0/\">{}{}\
-</rdf:Description></rdf:RDF></x:xmpmeta>",
-        prompt_tag, text_body
-    )
-}
-
-fn xml_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn build_exif_user_comment(chunks: &[(String, String)]) -> Result<Vec<u8>, AppError> {
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut map = serde_json::Map::new();
-    for (key, value) in chunks {
-        map.insert(key.clone(), serde_json::Value::String(value.clone()));
-    }
-    let json = serde_json::Value::Object(map).to_string();
-    let field = exif::Field {
-        tag: exif::Tag::UserComment,
-        ifd_num: exif::In::PRIMARY,
-        value: exif::Value::Ascii(vec![json.into_bytes()]),
-    };
-    let mut writer = exif::experimental::Writer::new();
-    writer.push_field(&field);
-    let mut buf = std::io::Cursor::new(Vec::new());
-    writer.write(&mut buf, false)?;
-    Ok(buf.into_inner())
-}
-
-fn embed_converted_metadata(
-    data: &[u8],
-    format: ConvertFormat,
-    chunks: &[(String, String)],
-) -> Result<Vec<u8>, AppError> {
-    if chunks.is_empty() {
-        return Ok(data.to_vec());
-    }
-    let xmp = build_xmp_packet(chunks);
-    let exif = build_exif_user_comment(chunks)?;
-    match format {
-        ConvertFormat::Webp => embed_webp_metadata(data, &exif, &xmp),
-        ConvertFormat::Jpeg => embed_jpeg_metadata(data, &exif, &xmp),
-        ConvertFormat::Jxl => Err(AppError::Invalid("JXL metadata is handled elsewhere".to_string())),
-    }
-}
-
-fn embed_webp_metadata(data: &[u8], exif: &[u8], xmp: &str) -> Result<Vec<u8>, AppError> {
-    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
-        return Err(AppError::Invalid("Invalid WebP header".to_string()));
-    }
-    let mut chunks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
-    let mut offset = 12;
-    while offset + 8 <= data.len() {
-        let mut tag = [0u8; 4];
-        tag.copy_from_slice(&data[offset..offset + 4]);
-        let size_bytes = &data[offset + 4..offset + 8];
-        let size =
-            u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]])
-                as usize;
-        let data_start = offset + 8;
-        let data_end = data_start + size;
-        if data_end > data.len() {
-            break;
-        }
-        if &tag != b"EXIF" && &tag != b"XMP " {
-            chunks.push((tag, data[data_start..data_end].to_vec()));
-        }
-        let aligned = size + (size % 2);
-        offset = data_start + aligned;
-    }
-    if !exif.is_empty() {
-        chunks.push((*b"EXIF", exif.to_vec()));
-    }
-    if !xmp.is_empty() {
-        chunks.push((*b"XMP ", xmp.as_bytes().to_vec()));
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.extend_from_slice(b"WEBP");
-    for (tag, chunk) in chunks {
-        out.extend_from_slice(&tag);
-        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-        out.extend_from_slice(&chunk);
-        if chunk.len() % 2 == 1 {
-            out.push(0);
-        }
-    }
-    let riff_size = (out.len() - 8) as u32;
-    out[4..8].copy_from_slice(&riff_size.to_le_bytes());
-    Ok(out)
-}
-
-fn embed_jpeg_metadata(data: &[u8], exif: &[u8], xmp: &str) -> Result<Vec<u8>, AppError> {
-    if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
-        return Err(AppError::Invalid("Invalid JPEG header".to_string()));
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(&data[0..2]);
-    if !exif.is_empty() {
-        let mut payload = b"Exif\0\0".to_vec();
-        payload.extend_from_slice(exif);
-        out.extend_from_slice(&build_jpeg_app1_segment(&payload)?);
-    }
-    if !xmp.is_empty() {
-        let mut payload = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
-        payload.extend_from_slice(xmp.as_bytes());
-        out.extend_from_slice(&build_jpeg_app1_segment(&payload)?);
-    }
-    let mut offset = 2;
-    while offset + 4 <= data.len() {
-        if data[offset] != 0xFF {
-            out.extend_from_slice(&data[offset..]);
-            return Ok(out);
-        }
-        let marker = data[offset + 1];
-        if marker == 0xDA {
-            out.extend_from_slice(&data[offset..]);
-            return Ok(out);
-        }
-        if marker == 0xD9 {
-            out.extend_from_slice(&data[offset..offset + 2]);
-            return Ok(out);
-        }
-        if (0xD0..=0xD7).contains(&marker) {
-            out.extend_from_slice(&data[offset..offset + 2]);
-            offset += 2;
-            continue;
-        }
-        let seg_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
-        if seg_len < 2 || offset + 2 + seg_len > data.len() {
-            return Err(AppError::Invalid("Invalid JPEG segment".to_string()));
-        }
-        let seg_start = offset + 4;
-        let seg_end = offset + 2 + seg_len;
-        let payload = &data[seg_start..seg_end];
-        if marker == 0xE1
-            && (payload.starts_with(b"Exif\0\0")
-                || payload.starts_with(b"http://ns.adobe.com/xap/1.0/\0"))
-        {
-            offset += 2 + seg_len;
-            continue;
-        }
-        out.extend_from_slice(&data[offset..offset + 2 + seg_len]);
-        offset += 2 + seg_len;
-    }
-    Ok(out)
-}
-
-fn build_jpeg_app1_segment(payload: &[u8]) -> Result<Vec<u8>, AppError> {
-    let size = payload.len() + 2;
-    if size > u16::MAX as usize {
-        return Err(AppError::Invalid("APP1 payload too large".to_string()));
-    }
-    let mut out = Vec::with_capacity(2 + 2 + payload.len());
-    out.push(0xFF);
-    out.push(0xE1);
-    out.extend_from_slice(&(size as u16).to_be_bytes());
-    out.extend_from_slice(payload);
-    Ok(out)
-}
-
-fn jxl_metadata_compress(text_chunks: &[(String, String)]) -> bool {
-    if text_chunks.is_empty() {
-        return false;
-    }
-    false
-}
-
 fn build_jxl_encoder(
-    use_container: bool,
     parallel_runner: Option<&dyn ParallelRunner>,
 ) -> Result<JxlEncoder<'_, '_>, AppError> {
     let builder = jxl_encoder_builder()
         .has_alpha(true)
         .lossless(false)
         .quality(4.0)
-        .use_container(use_container)
+        .use_container(false)
         .uses_original_profile(true)
         .speed(EncoderSpeed::Thunder);
     let encoder = if let Some(runner) = parallel_runner {
@@ -1905,8 +1763,6 @@ fn jxl_parallel_threads() -> usize {
 
 fn convert_png_to_jxl(
     data: &[u8],
-    text_chunks: &[(String, String)],
-    has_json: bool,
 ) -> Result<ConversionOutcome, AppError> {
     let img = image::load_from_memory_with_format(data, ImageFormat::Png)?;
     let rgba = img.to_rgba8();
@@ -1917,50 +1773,10 @@ fn convert_png_to_jxl(
     // WHY: JXLのエンコードを高速化するためCPUコア数で固定並列にする
     let runner = ThreadsRunner::new(None, Some(jxl_parallel_threads()));
     let parallel_runner = runner.as_ref().map(|r| r as &dyn ParallelRunner);
-    let mut encoder = build_jxl_encoder(!text_chunks.is_empty(), parallel_runner)?;
-    if !text_chunks.is_empty() {
-        let mut metadata_failed = false;
-        // WHY: メタデータ圧縮はCPU負荷が高いため無圧縮にする
-        let compress_metadata = jxl_metadata_compress(text_chunks);
-        let xmp = build_xmp_packet(text_chunks);
-        let exif = match build_exif_user_comment(text_chunks) {
-            Ok(v) => v,
-            Err(_) => {
-                metadata_failed = true;
-                Vec::new()
-            }
-        };
-        if !metadata_failed {
-            let exif_box = build_jxl_exif_box(&exif);
-            if encoder
-                .add_metadata(&JxlMetadata::Exif(&exif_box), compress_metadata)
-                .is_err()
-            {
-                metadata_failed = true;
-            } else if encoder
-                .add_metadata(&JxlMetadata::Xmp(xmp.as_bytes()), compress_metadata)
-                .is_err()
-            {
-                metadata_failed = true;
-            }
-        }
-        if metadata_failed {
-            if !has_json {
-                return Ok(ConversionOutcome::KeepOriginal);
-            }
-            encoder = build_jxl_encoder(false, parallel_runner)?;
-        }
-    }
+    let mut encoder = build_jxl_encoder(parallel_runner)?;
     let frame = EncoderFrame::new(rgba.as_raw()).num_channels(4);
     let result = encoder.encode_frame::<u8, u8>(&frame, rgba.width(), rgba.height())?;
     Ok(ConversionOutcome::Converted(result.data))
-}
-
-fn build_jxl_exif_box(exif: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + exif.len());
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.extend_from_slice(exif);
-    out
 }
 
 
@@ -2216,6 +2032,13 @@ fn should_write_in_memory(zip_size: u64, free_bytes: Option<u64>) -> bool {
         .unwrap_or(false)
 }
 
+fn should_read_in_memory(zip_size: u64, free_bytes: Option<u64>) -> bool {
+    let headroom = zip_size / 5;
+    free_bytes
+        .map(|free| free >= zip_size.saturating_add(headroom))
+        .unwrap_or(false)
+}
+
 fn path_len_warning(path: &Path) -> Option<String> {
     let _ = path;
     // WHY: パス長警告は出さない方針に変更した
@@ -2279,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_png_to_webp_even_without_deletion() {
+    fn converts_png_to_webp_even_without_deletion_without_metadata() {
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("sample.zip");
 
@@ -2319,15 +2142,8 @@ mod tests {
 
         let mut webp = archive.by_name("a.webp").unwrap();
         let webp_bytes = read_zipfile_bytes(&mut webp).unwrap();
-        let xmp = extract_webp_chunk(&webp_bytes, b"XMP ").unwrap();
-        let xmp_text = String::from_utf8_lossy(&xmp).to_string();
-        assert!(xmp_text.contains("workflow"));
-        assert!(xmp_text.contains("prompt"));
-
-        let exif = extract_webp_chunk(&webp_bytes, b"EXIF").unwrap();
-        let exif_map = exif_user_comment_map(&exif);
-        assert_eq!(exif_map["prompt"], "cat");
-        assert_eq!(exif_map["workflow"], "flow");
+        assert!(extract_webp_chunk(&webp_bytes, b"XMP ").is_none());
+        assert!(extract_webp_chunk(&webp_bytes, b"EXIF").is_none());
 
         let features = BitstreamFeatures::new(&webp_bytes).unwrap();
         assert!(matches!(features.format(), Some(BitstreamFormat::Lossy)));
@@ -2574,12 +2390,6 @@ mod tests {
     }
 
     #[test]
-    fn jxl_metadata_compress_is_disabled_for_speed() {
-        let chunks = vec![("prompt".to_string(), "cat".to_string())];
-        assert!(!jxl_metadata_compress(&chunks));
-    }
-
-    #[test]
     fn jxl_parallel_threads_uses_available_parallelism() {
         let cores = std::thread::available_parallelism()
             .map(|count| count.get())
@@ -2612,6 +2422,25 @@ mod tests {
         let zip_size = 10 * 1024 * 1024;
         let free = Some(zip_size + MEMORY_MARGIN_BYTES + 1);
         assert!(should_write_in_memory(zip_size, free));
+    }
+
+    #[test]
+    fn should_read_in_memory_when_free_is_enough() {
+        let zip_size = 10 * 1024 * 1024;
+        let free = Some(zip_size + (zip_size / 5));
+        assert!(should_read_in_memory(zip_size, free));
+    }
+
+    #[test]
+    fn should_not_read_in_memory_when_free_is_small() {
+        let zip_size = 10 * 1024 * 1024;
+        let free = Some(zip_size + (zip_size / 5) - 1);
+        assert!(!should_read_in_memory(zip_size, free));
+    }
+
+    #[test]
+    fn should_not_read_in_memory_when_free_is_unknown() {
+        assert!(!should_read_in_memory(1, None));
     }
 
     #[test]
@@ -2668,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_png_when_metadata_embed_fails_without_json() {
+    fn converts_png_to_jpg_without_metadata_even_with_large_prompt() {
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("sample.zip");
 
@@ -2701,8 +2530,8 @@ mod tests {
         let names: Vec<String> = (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
-        assert!(names.contains(&"a.png".to_string()));
-        assert!(!names.contains(&"a.jpg".to_string()));
+        assert!(!names.contains(&"a.png".to_string()));
+        assert!(names.contains(&"a.jpg".to_string()));
     }
 
     #[test]
@@ -3349,22 +3178,6 @@ mod tests {
     fn display_path_strips_verbatim_prefix() {
         let path = Path::new(r"\\?\C:\temp\sample.zip");
         assert_eq!(display_path(path), r"C:\temp\sample.zip");
-    }
-
-    fn exif_user_comment_map(exif_data: &[u8]) -> serde_json::Value {
-        let mut cursor = std::io::Cursor::new(exif_data);
-        let exif = exif::Reader::new().read_from_container(&mut cursor).unwrap();
-        for f in exif.fields() {
-            if f.tag == exif::Tag::UserComment {
-                if let exif::Value::Ascii(ref vec) = f.value {
-                    if let Some(bytes) = vec.get(0) {
-                        let s = String::from_utf8_lossy(bytes).to_string();
-                        return serde_json::from_str(&s).unwrap();
-                    }
-                }
-            }
-        }
-        serde_json::Value::Null
     }
 
     fn make_png_with_text_chunks(chunks: &[(&str, &str)]) -> Vec<u8> {
