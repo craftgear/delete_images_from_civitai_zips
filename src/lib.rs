@@ -8,29 +8,29 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use filetime::{set_file_times, FileTime};
-use indicatif::{ProgressBar, ProgressStyle};
+use filetime::{FileTime, set_file_times};
 use image::codecs::jpeg::JpegEncoder;
-use image::{ExtendedColorType, ImageFormat};
-use jpegxl_rs::encode::{EncoderFrame, JxlEncoder};
+use image::imageops::FilterType;
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageFormat};
+use indicatif::{ProgressBar, ProgressStyle};
+use jpegxl_rs::ThreadsRunner;
 use jpegxl_rs::encode::EncoderSpeed;
+use jpegxl_rs::encode::{EncoderFrame, JxlEncoder};
 use jpegxl_rs::encoder_builder as jxl_encoder_builder;
 use jpegxl_rs::parallel::ParallelRunner;
-use jpegxl_rs::ThreadsRunner;
 use rayon::prelude::*;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use signal_hook::consts::SIGINT;
 use signal_hook::flag as signal_flag;
 use sysinfo::System;
+use tempfile::Builder;
 use thiserror::Error;
-use webp::{Encoder as WebpEncoder, WebPConfig};
 use walkdir::WalkDir;
+use webp::{Encoder as WebpEncoder, WebPConfig};
+use zip::ZipArchive;
 use zip::read::ZipFile;
 use zip::write::FileOptions;
-use zip::ZipArchive;
-use tempfile::Builder;
-
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -56,6 +56,8 @@ pub enum AppError {
     Image(#[from] image::ImageError),
     #[error("JXL encode error: {0}")]
     JxlEncode(#[from] jpegxl_rs::EncodeError),
+    #[error("Invalid data: {0}")]
+    Conversion(String),
     #[error("Invalid data: {0}")]
     Invalid(String),
     #[error("Interrupted")]
@@ -176,7 +178,7 @@ impl Iterator for ConversionInputIter {
                     return Some(Err(AppError::ZipWithPath {
                         path: self.zip_path_display.clone(),
                         source: e,
-                    }))
+                    }));
                 }
             };
             if file.name().ends_with('/') {
@@ -210,7 +212,6 @@ impl Iterator for ConversionInputIter {
     }
 }
 
-
 pub fn run(
     root: &Path,
     keywords_csv: &str,
@@ -222,7 +223,14 @@ pub fn run(
     let keyword_key = keyword_key(&keywords, convert);
     let cancel = Arc::new(AtomicBool::new(false));
     signal_flag::register(SIGINT, cancel.clone()).map_err(|e| AppError::Invalid(e.to_string()))?;
-    run_with_cancel(root, &keyword_key, &keywords, progress, convert, cancel.as_ref())
+    run_with_cancel(
+        root,
+        &keyword_key,
+        &keywords,
+        progress,
+        convert,
+        cancel.as_ref(),
+    )
 }
 
 fn run_with_cancel(
@@ -293,15 +301,14 @@ fn run_with_cancel(
             }
             continue;
         }
-        let changed =
-            match process_zip(path, &progress_info, keywords, progress, cancel, convert) {
-                Ok(v) => v,
-                Err(AppError::Interrupted) => return Err(AppError::Interrupted),
-                Err(e) => {
-                    errors.push((path.clone(), e));
-                    continue;
-                }
-            };
+        let changed = match process_zip(path, &progress_info, keywords, progress, cancel, convert) {
+            Ok(v) => v,
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(e) => {
+                errors.push((path.clone(), e));
+                continue;
+            }
+        };
         let final_hash = if changed {
             let meta_after = io_ctx(path, fs::metadata(&io_path(path)))?;
             zip_hash(path, &meta_after)
@@ -349,8 +356,10 @@ fn process_zip(
     // 読み取りフェーズ
     let (entries, scan_bar) = {
         let file = io_ctx(path, File::open(&io_path(path)))?;
-        let mut archive = ZipArchive::new(file)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+        let mut archive = ZipArchive::new(file).map_err(|e| AppError::ZipWithPath {
+            path: display_path(path),
+            source: e,
+        })?;
         let _total = archive.len() as u64;
 
         let scan_bar = if progress {
@@ -371,9 +380,10 @@ fn process_zip(
 
         let mut list = Vec::new();
         for i in 0..archive.len() {
-            let file = archive
-                .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+            let file = archive.by_index(i).map_err(|e| AppError::ZipWithPath {
+                path: display_path(path),
+                source: e,
+            })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -490,9 +500,10 @@ fn write_zip_entries<W: Write + Seek>(
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Interrupted);
         }
-        let file = src
-            .by_index(i)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+        let file = src.by_index(i).map_err(|e| AppError::ZipWithPath {
+            path: display_path(path),
+            source: e,
+        })?;
         if file.name().ends_with('/') {
             continue;
         }
@@ -500,14 +511,11 @@ fn write_zip_entries<W: Write + Seek>(
         if let Some(skip) = skip_stems {
             if let Some(kind) = entry_kinds.get(&name) {
                 if matches!(kind, EntryKind::Png | EntryKind::Json) {
-                    let stem = entry_stems
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            entry_meta_from_name(&name)
-                                .map(|m| m.stem)
-                                .unwrap_or(name.clone())
-                        });
+                    let stem = entry_stems.get(&name).cloned().unwrap_or_else(|| {
+                        entry_meta_from_name(&name)
+                            .map(|m| m.stem)
+                            .unwrap_or(name.clone())
+                    });
                     if skip.contains(&stem) {
                         advance_progress(bar, progress_info);
                         continue;
@@ -606,8 +614,12 @@ fn write_filtered_zip(
     }
 
     // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
-    let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+    let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?).map_err(|e| {
+        AppError::ZipWithPath {
+            path: display_path(path),
+            source: e,
+        }
+    })?;
     let mut skip_targets = HashSet::new();
     if let Some(plan) = conversion_plan {
         skip_targets.extend(plan.target_names.iter().cloned());
@@ -650,9 +662,7 @@ fn write_filtered_zip(
             cancel,
         )?;
         let buf = writer.finish()?;
-        let cursor = buf
-            .into_inner()
-            .map_err(|e| AppError::Io(e.into_error()))?;
+        let cursor = buf.into_inner().map_err(|e| AppError::Io(e.into_error()))?;
         let bytes = cursor.into_inner();
         if io_path(path).exists() {
             // WHY: Windows上書き問題回避
@@ -750,8 +760,12 @@ fn prepare_conversions(
         // WHY: 空きメモリがある場合は展開して並列読み取りを優先する
         return prepare_conversions_from_memory(path, plan, cancel, bar, progress_info);
     }
-    let archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+    let archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?).map_err(|e| {
+        AppError::ZipWithPath {
+            path: display_path(path),
+            source: e,
+        }
+    })?;
     if let Some(b) = bar {
         b.set_length(plan.by_png.len() as u64);
         b.set_position(0);
@@ -778,11 +792,7 @@ fn prepare_conversions(
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
-            let outcome = convert_png_for_format_with_skip(
-                &input.name,
-                &input.bytes,
-                format,
-            )?;
+            let outcome = convert_png_for_format_with_skip(&input.name, &input.bytes, format)?;
             if let Some(b) = bar {
                 b.inc(1);
             }
@@ -828,11 +838,8 @@ fn prepare_conversions_from_memory(
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
-            let bytes = read_zip_entry_bytes_from_memory(
-                &zip_path_display,
-                zip_bytes.as_slice(),
-                name,
-            )?;
+            let bytes =
+                read_zip_entry_bytes_from_memory(&zip_path_display, zip_bytes.as_slice(), name)?;
             let text_chunks = png_text_chunks(&bytes);
             let stem = entry_meta_from_name(name)?.stem;
             let input = ConversionInput {
@@ -842,11 +849,7 @@ fn prepare_conversions_from_memory(
                 bytes,
                 text_chunks,
             };
-            let outcome = convert_png_for_format_with_skip(
-                &input.name,
-                &input.bytes,
-                format,
-            )?;
+            let outcome = convert_png_for_format_with_skip(&input.name, &input.bytes, format)?;
             if let Some(b) = bar {
                 b.inc(1);
             }
@@ -984,15 +987,20 @@ fn decide_deletions(
 
     let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if json_count > 0 {
-        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?).map_err(|e| {
+            AppError::ZipWithPath {
+                path: display_path(path),
+                source: e,
+            }
+        })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
-            let mut file = src
-                .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+            let mut file = src.by_index(i).map_err(|e| AppError::ZipWithPath {
+                path: display_path(path),
+                source: e,
+            })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -1035,15 +1043,20 @@ fn decide_deletions(
     let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if !image_names.is_empty() {
         let image_name_set: HashSet<String> = image_names.into_iter().collect();
-        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
-            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?).map_err(|e| {
+            AppError::ZipWithPath {
+                path: display_path(path),
+                source: e,
+            }
+        })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
-            let mut file = src
-                .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
+            let mut file = src.by_index(i).map_err(|e| AppError::ZipWithPath {
+                path: display_path(path),
+                source: e,
+            })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -1110,11 +1123,7 @@ fn parse_keywords(csv: &str) -> Vec<String> {
     csv.split(',')
         .filter_map(|s| {
             let t = s.trim().to_ascii_lowercase();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
+            if t.is_empty() { None } else { Some(t) }
         })
         .collect()
 }
@@ -1146,7 +1155,8 @@ fn advance_progress(bar: Option<&ProgressBar>, info: &ProgressInfo) {
 }
 
 fn reset_scroll_base(info: &ProgressInfo) {
-    info.base_elapsed_ms.store(SCROLL_BASE_UNSET, Ordering::Relaxed);
+    info.base_elapsed_ms
+        .store(SCROLL_BASE_UNSET, Ordering::Relaxed);
 }
 
 fn progress_info_for_ticker(info: &ProgressInfo) -> ProgressInfo {
@@ -1288,12 +1298,10 @@ fn read_zip_entry_bytes_from_memory(
         path: zip_path_display.to_string(),
         source: e,
     })?;
-    let mut file = archive
-        .by_name(name)
-        .map_err(|e| AppError::ZipWithPath {
-            path: zip_path_display.to_string(),
-            source: e,
-        })?;
+    let mut file = archive.by_name(name).map_err(|e| AppError::ZipWithPath {
+        path: zip_path_display.to_string(),
+        source: e,
+    })?;
     read_zipfile_bytes(&mut file)
 }
 
@@ -1566,9 +1574,8 @@ fn extract_webp_chunk(data: &[u8], chunk: &[u8; 4]) -> Option<Vec<u8>> {
     while offset + 8 <= data.len() {
         let fourcc = &data[offset..offset + 4];
         let size_bytes = &data[offset + 4..offset + 8];
-        let size =
-            u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]])
-                as usize;
+        let size = u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]])
+            as usize;
         let data_start = offset + 8;
         let data_end = data_start + size;
         if data_end > data.len() {
@@ -1678,12 +1685,14 @@ fn convert_png_for_format_with_skip(
 ) -> Result<ConversionAttempt, AppError> {
     match convert_png_for_format(data, format) {
         Ok(outcome) => Ok(ConversionAttempt::Outcome(outcome)),
-        Err(AppError::Image(err)) => {
-            Ok(ConversionAttempt::Skipped(ConversionSkip {
-                name: name.to_string(),
-                error: err.to_string(),
-            }))
-        }
+        Err(AppError::Image(err)) => Ok(ConversionAttempt::Skipped(ConversionSkip {
+            name: name.to_string(),
+            error: err.to_string(),
+        })),
+        Err(AppError::Conversion(err)) => Ok(ConversionAttempt::Skipped(ConversionSkip {
+            name: name.to_string(),
+            error: err,
+        })),
         Err(e) => Err(e),
     }
 }
@@ -1705,6 +1714,7 @@ fn convert_png_bytes_basic(data: &[u8], format: ConvertFormat) -> Result<Vec<u8>
     let mut out = Vec::new();
     match format {
         ConvertFormat::Webp => {
+            let img = resize_to_webp_limits(img)?;
             let rgba = img.to_rgba8();
             let encoder = WebpEncoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
             let mut config = WebPConfig::new()
@@ -1715,7 +1725,7 @@ fn convert_png_bytes_basic(data: &[u8], format: ConvertFormat) -> Result<Vec<u8>
             config.method = 5;
             let webp = encoder
                 .encode_advanced(&config)
-                .map_err(|e| AppError::Invalid(format!("{:?}", e)))?;
+                .map_err(|e| AppError::Conversion(format!("{:?}", e)))?;
             out.extend_from_slice(&webp);
         }
         ConvertFormat::Jpeg => {
@@ -1733,6 +1743,26 @@ fn convert_png_bytes_basic(data: &[u8], format: ConvertFormat) -> Result<Vec<u8>
         }
     }
     Ok(out)
+}
+
+const WEBP_MAX_DIMENSION: u32 = 16_383;
+
+fn resize_to_webp_limits(img: DynamicImage) -> Result<DynamicImage, AppError> {
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return Err(AppError::Conversion(format!(
+            "VP8_ENC_ERROR_BAD_DIMENSION ({width}x{height})"
+        )));
+    }
+    if width <= WEBP_MAX_DIMENSION && height <= WEBP_MAX_DIMENSION {
+        return Ok(img);
+    }
+
+    let scale =
+        (WEBP_MAX_DIMENSION as f64 / width as f64).min(WEBP_MAX_DIMENSION as f64 / height as f64);
+    let new_width = ((width as f64) * scale).floor().max(1.0) as u32;
+    let new_height = ((height as f64) * scale).floor().max(1.0) as u32;
+    Ok(img.resize_exact(new_width, new_height, FilterType::Triangle))
 }
 
 fn build_jxl_encoder(
@@ -1761,9 +1791,7 @@ fn jxl_parallel_threads() -> usize {
     if half == 0 { 1 } else { half }
 }
 
-fn convert_png_to_jxl(
-    data: &[u8],
-) -> Result<ConversionOutcome, AppError> {
+fn convert_png_to_jxl(data: &[u8]) -> Result<ConversionOutcome, AppError> {
     let img = image::load_from_memory_with_format(data, ImageFormat::Png)?;
     let rgba = img.to_rgba8();
     if rgba.width() < 2 || rgba.height() < 2 {
@@ -1778,7 +1806,6 @@ fn convert_png_to_jxl(
     let result = encoder.encode_frame::<u8, u8>(&frame, rgba.width(), rgba.height())?;
     Ok(ConversionOutcome::Converted(result.data))
 }
-
 
 fn color_msg(msg: &str, code: &str) -> String {
     format!("\x1b[{}m{}\x1b[0m", code, msg)
@@ -1867,10 +1894,7 @@ fn dir_times(path: &Path) -> Option<(std::path::PathBuf, FileTime, FileTime)> {
 }
 
 fn is_model_info(name: &str) -> bool {
-    Path::new(name)
-        .file_name()
-        .map(|n| n == "model_info.json")
-        == Some(true)
+    Path::new(name).file_name().map(|n| n == "model_info.json") == Some(true)
 }
 
 fn maybe_insert_model_safe(target: &mut HashSet<String>, name: &str) {
@@ -2054,13 +2078,14 @@ fn warn_if_path_long(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use webp::{BitstreamFeatures, BitstreamFormat};
     use zip::CompressionMethod;
-    use zip::write::FileOptions;
     use zip::ZipWriter;
+    use zip::write::FileOptions;
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -2147,6 +2172,110 @@ mod tests {
 
         let features = BitstreamFeatures::new(&webp_bytes).unwrap();
         assert!(matches!(features.format(), Some(BitstreamFormat::Lossy)));
+    }
+
+    #[test]
+    fn converts_oversized_png_to_webp_by_resizing() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("a.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_text_chunks_size(
+                &[("prompt", "cat")],
+                20_000,
+                1,
+            ))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let progress_info = test_progress_info(&zip_path);
+        let cancel = AtomicBool::new(false);
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            Some(ConvertFormat::Webp),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&"a.webp".to_string()));
+        assert!(!names.contains(&"a.png".to_string()));
+
+        let mut webp = archive.by_name("a.webp").unwrap();
+        let webp_bytes = read_zipfile_bytes(&mut webp).unwrap();
+        let decoded = image::load_from_memory_with_format(&webp_bytes, ImageFormat::WebP).unwrap();
+        let (width, height) = decoded.dimensions();
+        assert!(width <= 16_383);
+        assert!(height >= 1);
+    }
+
+    #[test]
+    fn exports_workflow_json_when_png_was_resized_for_webp() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("sample.zip");
+
+        let workflow = r#"{"version":1,"nodes":[],"links":[]}"#;
+        let mut zip_file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(&mut zip_file);
+        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        writer.start_file("a.png", opts).unwrap();
+        writer
+            .write_all(&make_png_with_text_chunks_size(
+                &[("prompt", "cat"), ("workflow", workflow)],
+                20_000,
+                1,
+            ))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let progress_info = test_progress_info(&zip_path);
+        let cancel = AtomicBool::new(false);
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            Some(ConvertFormat::Webp),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&"a.webp".to_string()));
+        assert!(names.contains(&"a.comfyui-workflow.json".to_string()));
+
+        let mut json = archive.by_name("a.comfyui-workflow.json").unwrap();
+        let json_bytes = read_zipfile_bytes(&mut json).unwrap();
+        // WHY: 縮小の有無に関わらず元PNGのworkflow文字列をそのまま残す必要がある
+        assert_eq!(json_bytes, workflow.as_bytes());
+    }
+
+    #[test]
+    fn resize_to_webp_limits_scales_down_and_never_zero() {
+        let img = DynamicImage::new_rgba8(20_000, 1);
+        let resized = resize_to_webp_limits(img).unwrap();
+        let (width, height) = resized.dimensions();
+        assert_eq!(width, 16_383);
+        assert_eq!(height, 1);
     }
 
     #[test]
@@ -2548,15 +2677,20 @@ mod tests {
             .write_all(r#"{"prompt":"cat,dog"}"#.as_bytes())
             .unwrap();
         writer.start_file("a.png", opts).unwrap();
-        writer
-            .write_all(&make_png_with_prompt("other"))
-            .unwrap();
+        writer.write_all(&make_png_with_prompt("other")).unwrap();
         writer.finish().unwrap();
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
@@ -2583,8 +2717,15 @@ mod tests {
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
@@ -2606,15 +2747,20 @@ mod tests {
             .write_all(r#"{"title":"no prompt"}"#.as_bytes())
             .unwrap();
         writer.start_file("c.png", opts).unwrap();
-        writer
-            .write_all(&make_png_with_prompt("keeps"))
-            .unwrap();
+        writer.write_all(&make_png_with_prompt("keeps")).unwrap();
         writer.finish().unwrap();
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(!changed);
 
         let file = File::open(&zip_path).unwrap();
@@ -2632,19 +2778,22 @@ mod tests {
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
 
         writer.start_file("z.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.start_file("z.png", opts).unwrap();
-        writer
-            .write_all(&make_png_with_prompt("dog"))
-            .unwrap();
+        writer.write_all(&make_png_with_prompt("dog")).unwrap();
         writer.finish().unwrap();
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(!changed);
 
         let file = File::open(&zip_path).unwrap();
@@ -2662,19 +2811,22 @@ mod tests {
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
 
         writer.start_file("q.png", opts).unwrap();
-        writer
-            .write_all(&make_png_with_prompt("cat"))
-            .unwrap();
+        writer.write_all(&make_png_with_prompt("cat")).unwrap();
         writer.start_file("q.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"dog"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"dog"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(changed);
 
         let file = File::open(&zip_path).unwrap();
@@ -2736,9 +2888,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("d.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"bird"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"bird"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let meta = fs::metadata(&zip_path).unwrap();
@@ -2748,8 +2898,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["cat".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["cat".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(!changed);
 
         let meta_after = fs::metadata(&zip_path).unwrap();
@@ -2770,9 +2927,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("p.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         run(dir.path(), "dog", true, None).unwrap();
@@ -2801,18 +2956,22 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("a.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.start_file("model_info.json", opts).unwrap();
-        writer
-            .write_all(r#"{"meta":"keep"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"meta":"keep"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        process_zip(&zip_path, &progress_info, &vec!["cat".into()], false, &cancel, None).unwrap();
+        process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["cat".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
 
         let file = File::open(&zip_path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -2830,9 +2989,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("x.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let meta_before = fs::metadata(&zip_path).unwrap();
@@ -2840,8 +2997,15 @@ mod tests {
 
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["dog".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["dog".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(!changed);
 
         let meta_after = fs::metadata(&zip_path).unwrap();
@@ -2858,9 +3022,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("e.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let meta_before = fs::metadata(dir.path()).unwrap();
@@ -2869,8 +3031,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let progress_info = test_progress_info(&zip_path);
         let cancel = AtomicBool::new(false);
-        let changed =
-            process_zip(&zip_path, &progress_info, &vec!["cat".into()], false, &cancel, None).unwrap();
+        let changed = process_zip(
+            &zip_path,
+            &progress_info,
+            &vec!["cat".into()],
+            false,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(changed);
 
         let meta_after = fs::metadata(dir.path()).unwrap();
@@ -2895,8 +3064,18 @@ mod tests {
         let mut cache = CacheMap::new();
         cache_insert(&mut cache, "cat", &zip_path, hash);
 
-        assert!(cache_hit(&cache, "cat", &zip_path, &zip_hash(&zip_path, &meta)));
-        assert!(!cache_hit(&cache, "dog", &zip_path, &zip_hash(&zip_path, &meta)));
+        assert!(cache_hit(
+            &cache,
+            "cat",
+            &zip_path,
+            &zip_hash(&zip_path, &meta)
+        ));
+        assert!(!cache_hit(
+            &cache,
+            "dog",
+            &zip_path,
+            &zip_hash(&zip_path, &meta)
+        ));
     }
 
     #[test]
@@ -3081,9 +3260,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("a.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.finish().unwrap();
 
         let bad = dir.path().join("bad.zip");
@@ -3095,10 +3272,7 @@ mod tests {
         let cache = load_cache(&cache_file_path());
         let keyword_key = keyword_key(&vec!["cat".into()], None);
         let key = good.display().to_string();
-        assert!(cache
-            .get(&keyword_key)
-            .and_then(|m| m.get(&key))
-            .is_some());
+        assert!(cache.get(&keyword_key).and_then(|m| m.get(&key)).is_some());
 
         match prev {
             Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
@@ -3118,9 +3292,7 @@ mod tests {
         let mut writer = ZipWriter::new(&mut zip_file);
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
         writer.start_file("a.json", opts).unwrap();
-        writer
-            .write_all(r#"{"prompt":"cat"}"#.as_bytes())
-            .unwrap();
+        writer.write_all(r#"{"prompt":"cat"}"#.as_bytes()).unwrap();
         writer.start_file("a.png", opts).unwrap();
         writer.write_all(&make_png_with_prompt("other")).unwrap();
         writer.finish().unwrap();
@@ -3136,10 +3308,7 @@ mod tests {
         let cache = load_cache(&cache_file_path());
         let keyword_key = keyword_key(&vec!["cat".into()], None);
         let key = zip_path.display().to_string();
-        let cached = cache
-            .get(&keyword_key)
-            .and_then(|m| m.get(&key))
-            .cloned();
+        let cached = cache.get(&keyword_key).and_then(|m| m.get(&key)).cloned();
 
         assert_eq!(cached, Some(hash_after));
         assert_ne!(cached, Some(hash_before));
@@ -3149,7 +3318,6 @@ mod tests {
             None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
         }
     }
-
 
     #[test]
     fn path_len_warning_returns_none_for_short_path() {
@@ -3210,7 +3378,9 @@ mod tests {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        encoder.add_text_chunk("prompt".into(), prompt.into()).unwrap();
+        encoder
+            .add_text_chunk("prompt".into(), prompt.into())
+            .unwrap();
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(&[0, 0, 0]).unwrap();
         writer.finish().unwrap();

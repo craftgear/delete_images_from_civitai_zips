@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use delete_or_convert_images_from_civitai_zips::{run, AppError, ConvertFormat};
+use delete_or_convert_images_from_civitai_zips::{AppError, ConvertFormat, run};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
