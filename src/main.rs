@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use delete_or_convert_images_from_civitai_zips::{AppError, ConvertFormat, run};
+use delete_or_convert_pngs_of_civitai_zips::{AppError, ConvertFormat, run};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -30,7 +30,7 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.clear_cache {
-        delete_or_convert_images_from_civitai_zips::clear_cache_file()
+        delete_or_convert_pngs_of_civitai_zips::clear_cache_file()
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }

@@ -1835,7 +1835,7 @@ fn cache_file_path() -> std::path::PathBuf {
         .or_else(|| env::var_os("HOME").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     base.join(".cache")
-        .join("delete_or_convert_images_from_civitai_zips")
+        .join("delete_or_convert_pngs_of_civitai_zips")
         .join("processed.json")
 }
 
@@ -2927,6 +2927,8 @@ mod tests {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("p.zip");
+        let prev = env::var("DELETE_IMAGES_CACHE_HOME").ok();
+        unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", dir.path()) };
 
         let mut zip_file = File::create(&zip_path).unwrap();
         let mut writer = ZipWriter::new(&mut zip_file);
@@ -2936,6 +2938,11 @@ mod tests {
         writer.finish().unwrap();
 
         run(dir.path(), "dog", true, None).unwrap();
+
+        match prev {
+            Some(v) => unsafe { env::set_var("DELETE_IMAGES_CACHE_HOME", v) },
+            None => unsafe { env::remove_var("DELETE_IMAGES_CACHE_HOME") },
+        }
     }
 
     #[test]
@@ -3120,7 +3127,7 @@ mod tests {
 
         let cache = dir
             .path()
-            .join(".cache/delete_or_convert_images_from_civitai_zips/processed.json");
+            .join(".cache/delete_or_convert_pngs_of_civitai_zips/processed.json");
         fs::create_dir_all(cache.parent().unwrap()).unwrap();
         fs::write(&cache, "{}").unwrap();
 
